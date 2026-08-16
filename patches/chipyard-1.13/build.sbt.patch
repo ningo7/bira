@@ -1,0 +1,31 @@
+diff --git a/build.sbt b/build.sbt
+--- a/build.sbt
++++ b/build.sbt
+@@ -228,3 +228,6 @@
+     "tacit" -> tacit,
+     "gemmini" -> gemmini,
++    // BEGIN BIRA INTEGRATION: optional-module
++    "bira" -> bira,
++    // END BIRA INTEGRATION: optional-module
+     "nvdla" -> nvdla,
+@@ -367,6 +370,19 @@ lazy val gemmini = withInitCheck(freshProject("gemmini", file("generators/gemmini")), "gemmini")
+ lazy val gemmini = withInitCheck(freshProject("gemmini", file("generators/gemmini")), "gemmini")
+   .dependsOn(rocketchip)
+   .settings(libraryDependencies ++= rocketLibDeps.value)
+   .settings(commonSettings)
+-
++
++// BEGIN BIRA INTEGRATION: project
++lazy val bira = freshProject("bira", file("generators/bira/hw"))
++  .dependsOn(rocketchip)
++  .settings(libraryDependencies ++= rocketLibDeps.value)
++  .settings(commonSettings)
++  .settings(scalaTestSettings)
++  .settings(
++    Test / scalaSource := baseDirectory.value / "test" / "scala",
++    Test / resourceDirectory :=
++      baseDirectory.value / "test" / "resources"
++  )
++// END BIRA INTEGRATION: project
++
+ lazy val nvdla = withInitCheck((project in file("generators/nvdla")), "nvdla")

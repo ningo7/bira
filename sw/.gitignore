@@ -1,0 +1,37 @@
+.DS_Store
+.idea/
+.vscode/
+.ipynb_checkpoints/
+__pycache__/
+.pytest_cache/
+.venv/
+
+# Training/evaluation data and locally produced model artifacts
+datasets/
+outputs/
+checkpoints/
+runs/
+logs/
+wandb/
+lightning_logs/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.h5
+*.hdf5
+*.npy
+*.npz
+
+# Keep the small model-owned regression checkpoint, not user checkpoints.
+!/models/bfsrcnn/tests/fixtures/
+!/models/bfsrcnn/tests/fixtures/bfsrcnn_integer_v4.pth
+
+# Generated code, fixtures and native build products
+build/
+*.o
+*.a
+*.so
+*.elf
+*.riscv
+*.dump

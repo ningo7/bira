@@ -1,0 +1,83 @@
+# Hardware and Scala build products
+build/
+target/
+out/
+test_run_dir/
+.scala-build/
+/hw/*.sv
+/hw/project/project/
+/hw/project/metals.sbt
+
+docs/
+
+# Native simulation and waveform products
+*.o
+*.d
+*.a
+*.so
+*.elf
+*.riscv
+*.dump
+*.vcd
+*.fst
+*.vpd
+*.wlf
+core
+core.*
+!/sw/models/common/quantization/core.py
+
+# Python caches, packaging and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+dist/
+*.egg-info/
+
+# SBT, Mill, Metals and editor state
+.bloop/
+.metals/
+.bsp/
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# Local training data, checkpoints and experiment output
+datasets/
+outputs/
+checkpoints/
+runs/
+logs/
+wandb/
+lightning_logs/
+tensorboard/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.h5
+*.hdf5
+*.npy
+*.npz
+events.out.tfevents.*
+
+# Keep the small model-owned regression checkpoint, not user checkpoints.
+!/sw/models/bfsrcnn/tests/fixtures/
+!/sw/models/bfsrcnn/tests/fixtures/bfsrcnn_integer_v4.pth
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Recoverable metadata from the pre-Chipyard hw/sw repositories.
+/.migration-backup/
+
+# Generated software output is reproducible from the model and generator.
+/sw/build/

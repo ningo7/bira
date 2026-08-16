@@ -1,0 +1,29 @@
+{
+  "expected_bytes": 256,
+  "format": "bira-verilator-fixture-v2",
+  "input": {
+    "core_x": 4,
+    "core_y": 4,
+    "input_height": 4,
+    "input_width": 4,
+    "lr_height": 120,
+    "lr_width": 125,
+    "scale": 4,
+    "source_image": "sw/models/bfsrcnn/datasets/Set14/baboon.png",
+    "tile_column": 1,
+    "tile_pad": 0,
+    "tile_row": 1,
+    "tile_size": 4,
+    "tile_x": 4,
+    "tile_y": 4
+  },
+  "input_height": 4,
+  "input_kind": "real-image-patch",
+  "input_width": 4,
+  "network_flow": "quantized data export -> programmer-written C inference -> Runtime planner -> Trace/RoCC",
+  "output_height": 16,
+  "output_width": 16,
+  "source_checkpoint": "sw/models/bfsrcnn/tests/fixtures/bfsrcnn_integer_v4.pth",
+  "source_generated_data": "sw/build/bfsrcnn/generated",
+  "standalone_layer_test": "prepared and submitted all 14 BFSRCNN layers independently"
+}

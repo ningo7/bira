@@ -1,0 +1,8 @@
+# Standard HDF5 training.
+python -m models.bfsrcnn.training.train --train-file models/bfsrcnn/datasets/91-image_x4.h5 --eval-file models/bfsrcnn/datasets/Set5_x4.h5 --outputs-dir models/bfsrcnn/outputs --scale 4 --lr 1e-3 --batch-size 16 --num-epochs 100 --num-workers 8 --seed 123
+
+# Context-patch training from original HR images.
+python -m models.bfsrcnn.training.train_patch --train-images-dir models/bfsrcnn/datasets/91-image --eval-file models/bfsrcnn/datasets/Set5_x4.h5 --outputs-dir models/bfsrcnn/outputs --scale 4 --patch-size 32 --halo 12 --patches-per-image 32 --batch-size 16 --num-epochs 100
+
+# Build a full-image aligned HDF5 dataset for patch training.
+python -m models.bfsrcnn.training.prepare --images-dir models/bfsrcnn/datasets/91-image --output-path models/bfsrcnn/datasets/91-image_x4_full.h5 --scale 4 --eval
