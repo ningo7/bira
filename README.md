@@ -34,7 +34,9 @@ Model tools perform quantization and parameter layout. Developers describe tenso
 
 ## Architecture Overview
 
-Architecture diagram in progress.
+![BIRA architecture overview](img/architecture-overview.png)
+
+*BIRA combines control and DMA, a unified binary–integer compute array, scalar post-processing, accumulators, and Full/Binary scratchpads.*
 
 BIRA draws on Gemmini's RoCC integration, Decoupled Access/Execute organization, explicitly managed scratchpad memory, and the verification workflow of combining standalone simulation with full-system SoC simulation. Its implementation includes the following features:
 
@@ -58,9 +60,25 @@ The default array has 16 lanes, with 16 configurable bit cells in each column:
 - A8 activations enter the array as bit planes. W2/W4/W8/W16 weights form 8/4/2/1 operand groups within a column, and the controller shifts and combines their results according to activation-bit significance;
 - The configurable adder tree accepts 1, 2, 4, 8, or 16 operands at the matching level, avoiding a separate full multiplier array for every supported precision.
 
+![Binary compute mode](img/binary-compute-mode.png)
+
+*Binary mode: bit cells perform XNOR and the full adder tree computes popcount.*
+
+![A8×W2 compute mode](img/a8-w2-compute-mode.png)
+
+*A8×W2 mode: adjacent bit cells form W2 operands and enter the adder tree at the matching level.*
+
+![A8×W4 compute mode](img/a8-w4-compute-mode.png)
+
+*A8×W4 mode: four bit cells form each W4 operand, reorganizing array parallelism for the selected precision.*
+
 This design does not expand both activations and weights into a fully bit-serial computation. Weight signs and bit positions remain local to each column, while activation bit-plane results are reconstructed locally. The integer path therefore avoids physical multi-bit multipliers without incurring all the extra iterations of a fully serial design.
 
 ## Tensor Layout and Configurable Dataflows
+
+![Tensor layout and configurable dataflows](img/tensor-layout-and-configurable-dataflows.png)
+
+*HWC layout, configurable input distribution and reduction, and implicit data reordering for PixelShuffle.*
 
 One Full SPAD row stores 16 consecutive channels, and logical tensors normally use an `HWC16`-like channel-blocked layout. The convolution controller computes local addresses directly from the output coordinate, kernel tap, and channel block. Taps outside the padding boundary do not generate a read, so the design does not require `im2col` or a window buffer.
 
@@ -76,6 +94,10 @@ The array follows a weight-stationary reuse strategy and adapts to different ope
 For data rearrangements such as PixelShuffle, BIRA writes the preceding layer directly in the pixel-pair layout required by the following layer. The next address generator then reads it using high-resolution coordinates. The rearrangement is therefore expressed as write-address and channel-index transformations rather than as a standalone data-reordering pass.
 
 ## Algorithm–Hardware Co-Optimization
+
+![Algorithm–hardware co-optimization](img/algorithm-hardware-co-optimization.png)
+
+*Halo-aware cross-layer patch execution, fused post-processing and rebinarization, Scale–RPReLU fusion, and multiplier-free PoT/APoT scaling.*
 
 ### Halo-Aware Image Patches
 
@@ -146,16 +168,6 @@ The parameter exporter does not generate network topology or inference C code. D
 
 The runtime offers two backends. The RoCC Driver executes real RV64 instructions in Chipyard, while the Trace Driver records the same commands and external-memory image on the host for replay by ChiselTest and standalone Verilator. A software-generated execution plan can therefore be reused across fast module-level verification and full SoC verification.
 
-## BFSRCNN x4 End-to-End Example
-
-The current example executes 14 layers in the order `head → shrink1 → shrink2 → shrink3 → mapping0…mapping7 → expand → final`. Together they cover:
-
-- Multi-bit convolution for the network boundaries and feature transformations;
-- Binary convolution, RPReLU, residual connections, and rebinarization in the mapping layers;
-- Implicit x4 PixelShuffle layout generation during expand writeback;
-- Column-reduce dataflow and a bilinear interpolation residual in the final layer;
-- Parameter export, cross-layer SPAD planning, two-dimensional DMA, standalone RTL simulation, and Chipyard bare-metal execution.
-
 ## Current Scope
 
 - Default 16-lane array, A8 activations, and 32-bit Accumulator;
@@ -166,6 +178,17 @@ The current example executes 14 layers in the order `head → shrink1 → shrink
 - Weight prefetching, overlapped compute/accumulate/post-processing, and cross-layer SPAD bank ping-pong;
 - Fused binary post-processing, PoT/APoT fixed-point scaling, implicit PixelShuffle, and bilinear residuals;
 - Three levels of verification: ChiselTest, standalone Verilator, and Chipyard Verilator.
+
+## Verification Results
+
+BIRA uses layered verification across software unit tests, ChiselTest, standalone Verilator, and Chipyard Verilator. The recorded BFSRCNN x4 test uses a 32×32 grayscale input and produces a 128×128 output. The complete 14-layer inference passes the 16,384-byte golden-output check in both standalone RTL and Chipyard simulations.
+
+| Result | Value |
+|---|---:|
+| Standalone BIRA RTL, 14-layer effective inference | 6,527,697 cycles |
+| Complete Chipyard `bfsrcnn_infer()` | 6,851,654 cycles |
+| Chipyard single-frame latency at an assumed 200 MHz | 34.258 ms |
+| Theoretical frame rate at an assumed 200 MHz | 29.19 FPS |
 
 ## Quick Start
 
@@ -199,8 +222,6 @@ cd generators/bira/hw
 sbt "runMain bira.GenBiRaStandaloneTop build/generated-rtl"
 ```
 
-For software dependencies, step-by-step verification, Chipyard integration, and complete bare-metal tests, see the [Getting Started guide](docs/getting-started.md).
-
 ## Repository Layout
 
 ```text
@@ -209,8 +230,7 @@ bira/
 ├── sw/          Quantization/deployment tools, C runtime, model applications, and simulation utilities
 ├── chipyard/    LazyRoCC, TLB/PTW, TileLink DMA, and SoC configuration
 ├── patches/     Build-system patches for specific Chipyard versions
-├── scripts/     Chipyard installation, validation, and removal scripts
-└── docs/        Architecture, software, testing, ISA/ABI, and model-dataflow documentation
+└── scripts/     Chipyard installation, validation, and removal scripts
 ```
 
 ## Roadmap

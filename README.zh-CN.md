@@ -34,7 +34,9 @@ BIRA 的硬件提供 Conv、FC 等通用计算模式，使用 Tensor 与层描�
 
 ## 架构总览
 
-图片绘制中
+![BIRA 架构总览](img/architecture-overview.png)
+
+*BIRA 由控制与 DMA、统一二值—整数计算阵列、标量后处理、累加器以及 Full/Binary Scratchpad 组成。*
 
 BIRA 借鉴了 Gemmini 的 RoCC 接入方式、Decoupled Access/Execute 思想、显式 Scratchpad 管理和“独立仿真 + SoC 全系统仿真”的验证流程。具体实现具有以下特点：
 
@@ -58,9 +60,25 @@ BIRA 借鉴了 Gemmini 的 RoCC 接入方式、Decoupled Access/Execute 思想�
 - A8 激活按 bit-plane 送入阵列，W2/W4/W8/W16 权重在列内分别组成 8/4/2/1 组操作数，再由控制器按激活位权重移位并合并；
 - 可配置加法树允许 1、2、4、8 或 16 个操作数从匹配层级进入，无需为每种精度复制一套完整乘法阵列。
 
+![二值计算模式](img/binary-compute-mode.png)
+
+*二值模式：bit cell 执行 XNOR，并由完整加法树完成 popcount。*
+
+![A8×W2 计算模式](img/a8-w2-compute-mode.png)
+
+*A8×W2 模式：相邻 bit cell 组成 W2 操作数，并从匹配层级进入加法树。*
+
+![A8×W4 计算模式](img/a8-w4-compute-mode.png)
+
+*A8×W4 模式：四个 bit cell 组成 W4 操作数，阵列并行度随精度重组。*
+
 这种实现不采用激活与权重均逐位展开的全 bit-serial 计算。权重位的符号和位置信息在列内保留，激活 bit-plane 的结果也在本地重构，因此整数路径无需物理多比特乘法器，同时避免全串行方案带来的额外循环。
 
 ## 张量布局与可配置数据流
+
+![张量布局与可配置数据流](img/tensor-layout-and-configurable-dataflows.png)
+
+*HWC 布局、可配置输入分发与归约，以及 PixelShuffle 的隐式数据重排。*
 
 Full SPAD 以 16 个连续通道为一行，逻辑 Tensor 通常采用类似 `HWC16` 的通道连续分块布局。卷积控制器根据输出坐标、kernel tap 和通道块直接生成本地地址，越过 padding 边界的 tap 不会发起读取，因此不需要`im2col` 或 window buffer。
 
@@ -76,6 +94,10 @@ Full SPAD 以 16 个连续通道为一行，逻辑 Tensor 通常采用类似 `HW
 对于 PixelShuffle 一类数据重排，BIRA 在前一层写回时直接生成后一层需要的 pixel-pair 布局，后续地址生成器再按高分辨率坐标读取。重排因此表现为写地址和通道索引变化，而不是一次独立的数据重排。
 
 ## 算法—硬件协同优化
+
+![算法—硬件协同优化](img/algorithm-hardware-co-optimization.png)
+
+*带 halo 的跨层 patch 执行、融合后处理与再次二值化、Scale–RPReLU 融合，以及基于 PoT/APoT 的无乘法缩放。*
 
 ### 带 halo 的图像 patch
 
@@ -112,6 +134,13 @@ x <  -t / s : y = α × s × x   + α × t + b_1
 
 量化工具使用 2 的幂（PoT）尺度和两项加法幂次（APoT）系数近似乘法形式的缩放。硬件以移位和加减实现多比特 requantization 及二值 RPReLU 分支，因此计算和后处理路径不需要通用多比特乘法器。
 
+\[
+\boxed{s\approx \pm2^{e_1}\pm2^{e_2}}
+\]
+\[
+\boxed{sx\approx (x\ll e_1)\pm(x\ll e_2)}
+\]
+
 ## ISA 与解耦执行
 
 BIRA ISA 使用 Rocket `CUSTOM_3` opcode，并将“层的静态配置”与“运行时任务”分离：
@@ -146,16 +175,6 @@ BIRA 采用“模型专用导出 + 通用推理引擎与 Runtime”的分层方�
 
 Runtime 提供两种后端：RoCC Driver 在 Chipyard 中执行真实 RV64 指令，Trace Driver 则在主机端记录相同的命令和外部内存镜像，供 ChiselTest 与独立 Verilator 回放。这使软件生成的执行计划能够在快速模块验证和完整 SoC 验证之间复用。
 
-## BFSRCNN x4 端到端样例
-
-当前样例按 `head → shrink1 → shrink2 → shrink3 → mapping0…mapping7 → expand → final` 执行，共 14 层。它同时覆盖：
-
-- 首尾及特征变换所需的多比特卷积；
-- mapping 层的二值卷积、RPReLU、残差和再次二值化；
-- expand 写回阶段的隐式 x4 PixelShuffle 布局；
-- final 的 column-reduce 数据流与双线性插值残差；
-- 参数导出、跨层 SPAD 规划、二维 DMA、独立 RTL 仿真和 Chipyard 裸机执行。
-
 ## 当前支持范围
 
 - 默认 16-lane 阵列、A8 激活和 32-bit Accumulator；
@@ -166,6 +185,17 @@ Runtime 提供两种后端：RoCC Driver 在 Chipyard 中执行真实 RV64 指�
 - 权重预取、计算/累加/后处理流水及跨层 SPAD bank 乒乓；
 - 二值后处理融合、PoT/APoT 定点缩放、隐式 PixelShuffle 和双线性残差；
 - ChiselTest、独立 Verilator 与 Chipyard Verilator 三层验证。
+
+## 测试验证
+
+BIRA 采用软件单元测试、ChiselTest、独立 Verilator 和 Chipyard Verilator 的分层验证流程。当前记录的 BFSRCNN x4 测试以 32×32 灰度图为输入、128×128 图像为输出，完整 14 层推理在独立 RTL 与 Chipyard 中均通过 16,384 B golden 输出校验。
+
+| 结果 | 数值 |
+|---|---:|
+| 独立 BIRA RTL，14 层有效推理 | 6,527,697 周期 |
+| Chipyard 完整 `bfsrcnn_infer()` | 6,851,654 周期 |
+| 按 200 MHz 换算的 Chipyard 单帧延迟 | 34.258 ms |
+| 按 200 MHz 换算的理论帧率 | 29.19 FPS |
 
 ## 快速开始
 
@@ -199,8 +229,6 @@ cd generators/bira/hw
 sbt "runMain bira.GenBiRaStandaloneTop build/generated-rtl"
 ```
 
-软件依赖、分步验证、Chipyard 集成和完整裸机测试请参阅[使用指南](docs/getting-started.md)。
-
 ## 仓库布局
 
 ```text
@@ -209,8 +237,7 @@ bira/
 ├── sw/          量化/部署工具、C Runtime、模型应用和仿真工具
 ├── chipyard/    LazyRoCC、TLB/PTW、TileLink DMA 和 SoC Config
 ├── patches/     面向指定 Chipyard 版本的构建系统补丁
-├── scripts/     Chipyard 安装、检查和卸载脚本
-└── docs/        架构、软件、测试、ISA/ABI 和模型数据流文档
+└── scripts/     Chipyard 安装、检查和卸载脚本
 ```
 
 ## 后续工作
