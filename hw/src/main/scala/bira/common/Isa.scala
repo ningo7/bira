@@ -9,9 +9,9 @@ import chisel3.util._
   *
   * The standalone frontend uses these values without depending on Rocket Chip.
   * A later LazyRoCC adapter only needs to translate RoCCCommand into
-  * [[BiRaRawCommand]].
+  * [[RawCmd]].
   */
-object BiRaFunct {
+object Funct {
   val cfgShape = 0x40
   val cfgAddr = 0x41
   val cfgMode = 0x42
@@ -24,7 +24,7 @@ object BiRaFunct {
   val tlbFlush = 0x49
 }
 
-object BiRaAddrRole {
+object AddrRole {
   val input = 0
   val weightLow = 1
   val weightHigh = 2
@@ -37,21 +37,21 @@ object BiRaAddrRole {
   val count = 9
 }
 
-object BiRaArrayMode {
+object ArrayMode {
   val dense = 0
   val depthwise = 1
   val binary = 2
   val columnReduce = 3
 }
 
-object BiRaWeightPrecision {
+object WgtPrecision {
   val w2 = 0
   val w4 = 1
   val w8 = 2
   val w16 = 3
 }
 
-object BiRaPostMode {
+object PostMode {
   val none = 0
   val intPrelu = 1
   val intRelu = 2
@@ -60,7 +60,7 @@ object BiRaPostMode {
   val finalBilinearResidual = 5
 }
 
-object BiRaError {
+object ErrorCode {
   val none = 0x00
   val invalidContext = 0x01
   val contextBusy = 0x02
@@ -84,7 +84,7 @@ object BiRaError {
 }
 
 /** Rocket-independent view of one decoded custom instruction. */
-class BiRaRawCommand extends Bundle {
+class RawCmd extends Bundle {
   val funct = UInt(7.W)
   val rs1 = UInt(64.W)
   val rs2 = UInt(64.W)
@@ -96,13 +96,13 @@ class BiRaRawCommand extends Bundle {
   val translationStatus = UInt(64.W)
 }
 
-class BiRaRawResponse extends Bundle {
+class RawResp extends Bundle {
   val rd = UInt(5.W)
   val data = UInt(64.W)
 }
 
 /** Compact LOAD_2D/STORE_2D descriptor after decoding rs2. */
-class BiRaDmaTask(p: BiRaParams) extends Bundle {
+class DmaTask(p: AccelParams) extends Bundle {
   val contextId = UInt(p.contextIdBits.W)
   val role = UInt(4.W)
   val dramVirtualAddress = UInt(64.W)
@@ -115,18 +115,18 @@ class BiRaDmaTask(p: BiRaParams) extends Bundle {
   val translationStatus = UInt(64.W)
 }
 
-class BiRaExecTask(p: BiRaParams) extends Bundle {
+class ExecTask(p: AccelParams) extends Bundle {
   val contextId = UInt(p.contextIdBits.W)
   val commandSequence = UInt(16.W)
 }
 
-class BiRaTaskCompletion(p: BiRaParams) extends Bundle {
+class Completion(p: AccelParams) extends Bundle {
   val contextId = UInt(p.contextIdBits.W)
   val commandSequence = UInt(16.W)
   val errorCode = UInt(8.W)
 }
 
-class BiRaSchedulerStatus extends Bundle {
+class SchedStatus extends Bundle {
   val loadQueueCount = UInt(8.W)
   val execQueueCount = UInt(8.W)
   val storeQueueCount = UInt(8.W)
@@ -136,7 +136,7 @@ class BiRaSchedulerStatus extends Bundle {
 }
 
 /** Context format shared by the frontend and the future scheduler. */
-class BiRaContext(p: BiRaParams) extends Bundle {
+class Context(p: AccelParams) extends Bundle {
   val building = Bool()
   val ready = Bool()
   val committed = Bool()
@@ -154,8 +154,8 @@ class BiRaContext(p: BiRaParams) extends Bundle {
   val paddingHeight = UInt(4.W)
   val paddingWidth = UInt(4.W)
 
-  val addressValid = UInt(BiRaAddrRole.count.W)
-  val baseRows = Vec(BiRaAddrRole.count, UInt(16.W))
+  val addressValid = UInt(AddrRole.count.W)
+  val baseRows = Vec(AddrRole.count, UInt(16.W))
 
   val arrayMode = UInt(2.W)
   val weightPrecision = UInt(2.W)
@@ -170,7 +170,7 @@ class BiRaContext(p: BiRaParams) extends Bundle {
   val errorCommandSequence = UInt(16.W)
 }
 
-class BiRaTlbFlushRequest extends Bundle {
+class FlushReq extends Bundle {
   /** ISA only defines a complete private-TLB invalidation. */
   val all = Bool()
 }

@@ -8,24 +8,24 @@ import chisel3.util._
 /** Converts one scheduled EXEC task and its Context into the existing core
   * command, loading every output block's decoded parameters first.
   */
-class BiRaExecBridge(p: BiRaParams) extends Module {
+class ExecBridge(p: AccelParams) extends Module {
   val io = IO(new Bundle {
-    val contexts = Input(Vec(p.nContexts, new BiRaContext(p)))
-    val task = Flipped(Decoupled(new BiRaExecTask(p)))
+    val contexts = Input(Vec(p.nContexts, new Context(p)))
+    val task = Flipped(Decoupled(new ExecTask(p)))
     val parameterRequest =
-      Decoupled(new BiRaParameterBlockRead(p))
+      Decoupled(new ParamRead(p))
     val parameterResponse =
-      Flipped(Decoupled(new BiRaDecodedParameterBlock(p)))
+      Flipped(Decoupled(new DecodedParams(p)))
     val multiParameter =
-      Decoupled(new ConvolutionParameterWrite(p))
+      Decoupled(new ConvParamWrite(p))
     val binaryParameter =
-      Decoupled(new BinaryConvolutionParameterWrite(p))
+      Decoupled(new BinParamWrite(p))
     val multiCommand =
       Decoupled(new ConvolutionCommand(p))
     val binaryCommand =
       Decoupled(new BinaryConvolutionCommand(p))
     val coreStatus = Input(new AcceleratorStatus)
-    val completion = Decoupled(new BiRaTaskCompletion(p))
+    val completion = Decoupled(new Completion(p))
   })
 
   private val Seq(
@@ -38,17 +38,17 @@ class BiRaExecBridge(p: BiRaParams) extends Module {
     complete
   ) = Enum(7)
   private val state = RegInit(idle)
-  private val taskReg = Reg(new BiRaExecTask(p))
-  private val contextReg = Reg(new BiRaContext(p))
+  private val taskReg = Reg(new ExecTask(p))
+  private val contextReg = Reg(new Context(p))
   private val block = RegInit(0.U(p.blockIndexBits.W))
   private val blocks = Reg(UInt(p.blockIndexBits.W))
   private val decoded =
-    Reg(new BiRaDecodedParameterBlock(p))
-  private val completionError = RegInit(BiRaError.none.U(8.W))
+    Reg(new DecodedParams(p))
+  private val completionError = RegInit(ErrorCode.none.U(8.W))
 
   private val selectedContext = MuxLookup(
     io.task.bits.contextId,
-    0.U.asTypeOf(new BiRaContext(p))
+    0.U.asTypeOf(new Context(p))
   )(
     (0 until p.nContexts).map(index =>
       index.U -> io.contexts(index)
@@ -58,17 +58,17 @@ class BiRaExecBridge(p: BiRaParams) extends Module {
     ((selectedContext.outputChannels + (p.dim - 1).U) >>
       p.laneIndexBits)(p.blockIndexBits - 1, 0)
   private val taskError = MuxCase(
-    BiRaError.none.U,
+    ErrorCode.none.U,
     Seq(
       (io.task.bits.contextId >= p.nContexts.U) ->
-        BiRaError.invalidContext.U,
+        ErrorCode.invalidContext.U,
       (!selectedContext.ready || !selectedContext.committed) ->
-        BiRaError.contextNotReady.U,
-      (selectedContext.errorCode =/= BiRaError.none.U) ->
-        BiRaError.contextFailed.U,
+        ErrorCode.contextNotReady.U,
+      (selectedContext.errorCode =/= ErrorCode.none.U) ->
+        ErrorCode.contextFailed.U,
       (selectedBlocks === 0.U ||
         selectedBlocks > p.maxOutputBlocks.U) ->
-        BiRaError.badShape.U
+        ErrorCode.badShape.U
     )
   )
 
@@ -80,7 +80,7 @@ class BiRaExecBridge(p: BiRaParams) extends Module {
     block := 0.U
     completionError := taskError
     state := Mux(
-      taskError =/= BiRaError.none.U,
+      taskError =/= ErrorCode.none.U,
       complete,
       requestParameter
     )
@@ -88,7 +88,7 @@ class BiRaExecBridge(p: BiRaParams) extends Module {
 
   io.parameterRequest.valid := state === requestParameter
   io.parameterRequest.bits.baseRow :=
-    contextReg.baseRows(BiRaAddrRole.parameter)(
+    contextReg.baseRows(AddrRole.parameter)(
       p.parameterAddressBits - 1,
       0
     )
@@ -104,7 +104,7 @@ class BiRaExecBridge(p: BiRaParams) extends Module {
   }
 
   private val binaryMode =
-    contextReg.arrayMode === BiRaArrayMode.binary.U
+    contextReg.arrayMode === ArrayMode.binary.U
   io.multiParameter.valid :=
     state === writeParameter && !binaryMode
   io.multiParameter.bits := decoded.multiBit
@@ -126,19 +126,19 @@ class BiRaExecBridge(p: BiRaParams) extends Module {
     0.U.asTypeOf(new ConvolutionCommand(p))
   )
   multi.inputBase :=
-    contextReg.baseRows(BiRaAddrRole.input)
+    contextReg.baseRows(AddrRole.input)
   multi.weightLowBase :=
-    contextReg.baseRows(BiRaAddrRole.weightLow)
+    contextReg.baseRows(AddrRole.weightLow)
   multi.weightHighBase :=
-    contextReg.baseRows(BiRaAddrRole.weightHigh)
+    contextReg.baseRows(AddrRole.weightHigh)
   multi.outputBase :=
-    contextReg.baseRows(BiRaAddrRole.outputFull)
+    contextReg.baseRows(AddrRole.outputFull)
   multi.binaryOutputBase :=
-    contextReg.baseRows(BiRaAddrRole.outputBinary)
+    contextReg.baseRows(AddrRole.outputBinary)
   multi.accumulatorBase :=
-    contextReg.baseRows(BiRaAddrRole.accumulator)
+    contextReg.baseRows(AddrRole.accumulator)
   multi.residualBase :=
-    contextReg.baseRows(BiRaAddrRole.residual)
+    contextReg.baseRows(AddrRole.residual)
   multi.inputHeight := contextReg.inputHeight
   multi.inputWidth := contextReg.inputWidth
   multi.outputHeight := contextReg.outputHeight
@@ -154,20 +154,20 @@ class BiRaExecBridge(p: BiRaParams) extends Module {
     16.U
   )(
     Seq(
-      BiRaWeightPrecision.w2.U -> 2.U,
-      BiRaWeightPrecision.w4.U -> 4.U,
-      BiRaWeightPrecision.w8.U -> 8.U,
-      BiRaWeightPrecision.w16.U -> 16.U
+      WgtPrecision.w2.U -> 2.U,
+      WgtPrecision.w4.U -> 4.U,
+      WgtPrecision.w8.U -> 8.U,
+      WgtPrecision.w16.U -> 16.U
     )
   )
   multi.activationPrecision := p.activationBits.U
   multi.inputSigned := contextReg.inputSigned
   multi.depthwise :=
-    contextReg.arrayMode === BiRaArrayMode.depthwise.U
+    contextReg.arrayMode === ArrayMode.depthwise.U
   multi.columnReduce :=
-    contextReg.arrayMode === BiRaArrayMode.columnReduce.U
+    contextReg.arrayMode === ArrayMode.columnReduce.U
   multi.bilinearResidual :=
-    contextReg.postMode === BiRaPostMode.finalBilinearResidual.U
+    contextReg.postMode === PostMode.finalBilinearResidual.U
   multi.shufflePack2 := contextReg.shufflePack2
   multi.shuffleLog2 := log2Ceil(p.maxShuffleScale).U
   multi.writeFullOutput := contextReg.writeFull
@@ -177,19 +177,19 @@ class BiRaExecBridge(p: BiRaParams) extends Module {
     0.U.asTypeOf(new BinaryConvolutionCommand(p))
   )
   binary.inputBase :=
-    contextReg.baseRows(BiRaAddrRole.input)
+    contextReg.baseRows(AddrRole.input)
   binary.weightBase :=
-    contextReg.baseRows(BiRaAddrRole.weightLow)
+    contextReg.baseRows(AddrRole.weightLow)
   binary.binaryOutputBase :=
-    contextReg.baseRows(BiRaAddrRole.outputBinary)
+    contextReg.baseRows(AddrRole.outputBinary)
   binary.residualBase :=
-    contextReg.baseRows(BiRaAddrRole.residual)
+    contextReg.baseRows(AddrRole.residual)
   binary.fullOutputBase :=
-    contextReg.baseRows(BiRaAddrRole.outputFull)
+    contextReg.baseRows(AddrRole.outputFull)
   binary.correctionBase :=
-    contextReg.baseRows(BiRaAddrRole.correction)
+    contextReg.baseRows(AddrRole.correction)
   binary.accumulatorBase :=
-    contextReg.baseRows(BiRaAddrRole.accumulator)
+    contextReg.baseRows(AddrRole.accumulator)
   binary.inputHeight := contextReg.inputHeight
   binary.inputWidth := contextReg.inputWidth
   binary.outputHeight := contextReg.outputHeight
@@ -212,7 +212,7 @@ class BiRaExecBridge(p: BiRaParams) extends Module {
     state := run
   }
   when(state === run && io.coreStatus.done) {
-    completionError := BiRaError.none.U
+    completionError := ErrorCode.none.U
     state := complete
   }
 
@@ -226,21 +226,21 @@ class BiRaExecBridge(p: BiRaParams) extends Module {
 }
 
 /** Complete Rocket-independent compute/storage data plane. */
-class BiRaDataPlane(p: BiRaParams = BiRaParams()) extends Module {
+class DataPlane(p: AccelParams = AccelParams()) extends Module {
   val io = IO(new Bundle {
-    val contexts = Input(Vec(p.nContexts, new BiRaContext(p)))
-    val execTask = Flipped(Decoupled(new BiRaExecTask(p)))
-    val execCompletion = Decoupled(new BiRaTaskCompletion(p))
-    val localWrite = Flipped(Decoupled(new BiRaLocalRowWrite))
+    val contexts = Input(Vec(p.nContexts, new Context(p)))
+    val execTask = Flipped(Decoupled(new ExecTask(p)))
+    val execCompletion = Decoupled(new Completion(p))
+    val localWrite = Flipped(Decoupled(new LocalWrite))
     val localReadRequest =
-      Flipped(Decoupled(new BiRaLocalRowReadRequest))
-    val localReadResponse = Valid(new BiRaLocalRowReadResponse)
+      Flipped(Decoupled(new LocalReadReq))
+    val localReadResponse = Valid(new LocalReadResp)
     val busy = Output(Bool())
   })
 
-  private val core = Module(new BiRaCore(p))
-  private val parameters = Module(new BiRaParameterBuffer(p))
-  private val exec = Module(new BiRaExecBridge(p))
+  private val core = Module(new Core(p))
+  private val parameters = Module(new ParamBuffer(p))
+  private val exec = Module(new ExecBridge(p))
 
   exec.io.contexts := io.contexts
   exec.io.task <> io.execTask
@@ -273,13 +273,13 @@ class BiRaDataPlane(p: BiRaParams = BiRaParams()) extends Module {
 
   private val writeMemory = io.localWrite.bits.memory
   private val writeFull =
-    writeMemory === BiRaLocalMemory.full.U
+    writeMemory === LocalMem.full.U
   private val writeBinary =
-    writeMemory === BiRaLocalMemory.binary.U
+    writeMemory === LocalMem.binary.U
   private val writeAccumulator =
-    writeMemory === BiRaLocalMemory.accumulator.U
+    writeMemory === LocalMem.accumulator.U
   private val writeParameter =
-    writeMemory === BiRaLocalMemory.parameter.U
+    writeMemory === LocalMem.parameter.U
 
   core.io.fullWrite.valid := io.localWrite.valid && writeFull
   core.io.fullWrite.bits.address :=
@@ -337,51 +337,68 @@ class BiRaDataPlane(p: BiRaParams = BiRaParams()) extends Module {
     readError
   ) = Enum(5)
   private val readState = RegInit(readIdle)
+
+  // StoreCtrl has at most one local read in flight.  Capture that request at
+  // the data-plane boundary so its state transition depends only on registered
+  // occupancy, rather than on a combinational path through the selected SPAD
+  // bank arbiter.  The queued request remains stable until the memory accepts
+  // it; the eventual response still uses readState to select the return data.
+  private val localReadBuffer = Module(
+    new Queue(
+      new LocalReadReq,
+      entries = 1,
+      pipe = false,
+      flow = false
+    )
+  )
+  localReadBuffer.io.enq <> io.localReadRequest
+
+  private val bufferedRead = localReadBuffer.io.deq
   core.io.fullReadRequest.valid :=
     readState === readIdle &&
-      io.localReadRequest.valid &&
-      io.localReadRequest.bits.memory === BiRaLocalMemory.full.U
+      bufferedRead.valid &&
+      bufferedRead.bits.memory === LocalMem.full.U
   core.io.fullReadRequest.bits :=
-    io.localReadRequest.bits.address(p.fullAddressBits - 1, 0)
+    bufferedRead.bits.address(p.fullAddressBits - 1, 0)
   core.io.binaryReadRequest.valid :=
     readState === readIdle &&
-      io.localReadRequest.valid &&
-      io.localReadRequest.bits.memory === BiRaLocalMemory.binary.U
+      bufferedRead.valid &&
+      bufferedRead.bits.memory === LocalMem.binary.U
   core.io.binaryReadRequest.bits :=
-    io.localReadRequest.bits.address(p.binaryAddressBits - 1, 0)
+    bufferedRead.bits.address(p.binaryAddressBits - 1, 0)
   core.io.accumulatorReadRequest.valid :=
     readState === readIdle &&
-      io.localReadRequest.valid &&
-      io.localReadRequest.bits.memory === BiRaLocalMemory.accumulator.U
+      bufferedRead.valid &&
+      bufferedRead.bits.memory === LocalMem.accumulator.U
   core.io.accumulatorReadRequest.bits :=
-    io.localReadRequest.bits.address(
+    bufferedRead.bits.address(
       p.accumulatorAddressBits - 1,
       0
     )
 
-  io.localReadRequest.ready :=
+  bufferedRead.ready :=
     readState === readIdle &&
       MuxLookup(
-        io.localReadRequest.bits.memory,
+        bufferedRead.bits.memory,
         true.B
       )(
         Seq(
-          BiRaLocalMemory.full.U -> core.io.fullReadRequest.ready,
-          BiRaLocalMemory.binary.U ->
+          LocalMem.full.U -> core.io.fullReadRequest.ready,
+          LocalMem.binary.U ->
             core.io.binaryReadRequest.ready,
-          BiRaLocalMemory.accumulator.U ->
+          LocalMem.accumulator.U ->
             core.io.accumulatorReadRequest.ready
         )
       )
-  when(io.localReadRequest.fire) {
+  when(bufferedRead.fire) {
     readState := MuxLookup(
-      io.localReadRequest.bits.memory,
+      bufferedRead.bits.memory,
       readError
     )(
       Seq(
-        BiRaLocalMemory.full.U -> waitFull,
-        BiRaLocalMemory.binary.U -> waitBinary,
-        BiRaLocalMemory.accumulator.U -> waitAccumulator
+        LocalMem.full.U -> waitFull,
+        LocalMem.binary.U -> waitBinary,
+        LocalMem.accumulator.U -> waitAccumulator
       )
     )
   }
@@ -407,8 +424,8 @@ class BiRaDataPlane(p: BiRaParams = BiRaParams()) extends Module {
   io.localReadResponse.bits.errorCode :=
     Mux(
       readState === readError,
-      BiRaError.badRole.U,
-      BiRaError.none.U
+      ErrorCode.badRole.U,
+      ErrorCode.none.U
     )
   when(io.localReadResponse.valid) {
     readState := readIdle

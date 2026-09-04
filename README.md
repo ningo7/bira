@@ -46,7 +46,7 @@ BIRA draws on Gemmini's RoCC integration, Decoupled Access/Execute organization,
 - Current and prefetched weight buffers that hide weight-read latency at tile boundaries;
 - Software-planned SPAD bank ping-pong between adjacent layers.
 
-The standalone `BiRaStandaloneTop` exposes a simple memory interface and is intended for module verification, trace replay, and accelerator-internal cycle analysis. The Chipyard configuration adds Rocket, private TLB/PTW paths, and TileLink DMA for bare-metal software and full-system verification.
+The standalone `StandaloneTop` exposes a simple memory interface and is intended for module verification, trace replay, and accelerator-internal cycle analysis. The Chipyard configuration adds Rocket, private TLB/PTW paths, and TileLink DMA for bare-metal software and full-system verification.
 
 ## Binary–Integer Compute Array
 
@@ -181,14 +181,14 @@ The runtime offers two backends. The RoCC Driver executes real RV64 instructions
 
 ## Verification Results
 
-BIRA uses layered verification across software unit tests, ChiselTest, standalone Verilator, and Chipyard Verilator. The recorded BFSRCNN x4 test uses a 32×32 grayscale input and produces a 128×128 output. The complete 14-layer inference passes the 16,384-byte golden-output check in both standalone RTL and Chipyard simulations.
+BIRA uses layered verification across software unit tests, ChiselTest, standalone Verilator, and Chipyard Verilator. The recorded BFSRCNN x4 test uses a 32×32 grayscale input and produces a 128×128 output. The optimized standalone RTL passes the 16,384-byte golden-output check. A current-version Chipyard end-to-end result has not yet been measured.
 
 | Result | Value |
 |---|---:|
-| Standalone BIRA RTL, 14-layer effective inference | 6,527,697 cycles |
-| Complete Chipyard `bfsrcnn_infer()` | 6,851,654 cycles |
-| Chipyard single-frame latency at an assumed 200 MHz | 34.258 ms |
-| Theoretical frame rate at an assumed 200 MHz | 29.19 FPS |
+| Latest recorded optimized standalone BIRA RTL, 14-layer effective inference | 4,602,938 cycles |
+| Standalone latency at an assumed 200 MHz | 23.015 ms |
+| Standalone theoretical frame rate at an assumed 200 MHz | 43.45 FPS |
+| Current-version Chipyard `bfsrcnn_infer()` | Pending remeasurement |
 
 ## Quick Start
 
@@ -219,7 +219,7 @@ Generate only the standalone top-level RTL:
 
 ```bash
 cd generators/bira/hw
-sbt "runMain bira.GenBiRaStandaloneTop build/generated-rtl"
+sbt "runMain bira.GenStandaloneTop build/generated-rtl"
 ```
 
 ## Repository Layout

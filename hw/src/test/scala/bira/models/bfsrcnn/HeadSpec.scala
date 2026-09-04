@@ -7,18 +7,18 @@ import chisel3.simulator.EphemeralSimulator._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
-class BfsrcnnHeadSpec extends AnyFreeSpec with Matchers {
+class HeadSpec extends AnyFreeSpec with Matchers {
   private def signedByte(value: BigInt): Int = {
     val raw = value.toInt & 0xff
     if (raw >= 128) raw - 256 else raw
   }
 
   "standalone control must execute a padded uint8 x int16 head convolution" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 4,
       fullBanks = 5,
       binaryBanks = 2,
-      accumulatorBanks = 2,
+      accumulatorBanks = 1,
       bankRows = 32,
       maxImageHeight = 2,
       maxImageWidth = 3,
@@ -60,7 +60,7 @@ class BfsrcnnHeadSpec extends AnyFreeSpec with Matchers {
     val weightHighBase = 2 * p.bankRows
     val outputBase = 3 * p.bankRows
 
-    simulate(new BiRaCore(p)) { dut =>
+    simulate(new Core(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.command.valid.poke(false.B)
       dut.io.binaryCommand.valid.poke(false.B)

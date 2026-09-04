@@ -7,7 +7,7 @@ import chisel3.simulator.EphemeralSimulator._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
-class BfsrcnnShrink23Spec extends AnyFreeSpec with Matchers {
+class Shrink23Spec extends AnyFreeSpec with Matchers {
   private def signedByte(value: BigInt): Int = {
     val raw = value.toInt & 0xff
     if (raw >= 128) raw - 256 else raw
@@ -25,11 +25,11 @@ class BfsrcnnShrink23Spec extends AnyFreeSpec with Matchers {
   }
 
   "generic depthwise mode must execute shrink2 A8 W16 3x3 convolution" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 16,
       fullBanks = 6,
       binaryBanks = 2,
-      accumulatorBanks = 2,
+      accumulatorBanks = 1,
       bankRows = 128,
       maxImageHeight = 2,
       maxImageWidth = 3,
@@ -76,7 +76,7 @@ class BfsrcnnShrink23Spec extends AnyFreeSpec with Matchers {
     val weightHighBase = 2 * p.bankRows
     val outputBase = 3 * p.bankRows
 
-    simulate(new BiRaCore(p)) { dut =>
+    simulate(new Core(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.command.valid.poke(false.B)
       dut.io.binaryCommand.valid.poke(false.B)
@@ -216,11 +216,11 @@ class BfsrcnnShrink23Spec extends AnyFreeSpec with Matchers {
   }
 
   "generic dense mode must execute shrink3 and write full plus thresholded binary state" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 16,
       fullBanks = 6,
       binaryBanks = 2,
-      accumulatorBanks = 2,
+      accumulatorBanks = 1,
       bankRows = 128,
       maxImageHeight = 2,
       maxImageWidth = 2,
@@ -262,7 +262,7 @@ class BfsrcnnShrink23Spec extends AnyFreeSpec with Matchers {
     val outputBase = 3 * p.bankRows
     val binaryOutputBase = 0
 
-    simulate(new BiRaCore(p)) { dut =>
+    simulate(new Core(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.command.valid.poke(false.B)
       dut.io.binaryCommand.valid.poke(false.B)

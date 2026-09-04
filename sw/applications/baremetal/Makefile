@@ -8,7 +8,7 @@ COMMON := $(CHIPYARD_ROOT)/toolchains/riscv-tools/riscv-tests/benchmarks/common
 RISCV_TEST_ENV := $(CHIPYARD_ROOT)/toolchains/riscv-tools/riscv-tests/env
 RUNTIME_INCLUDE := $(SW_ROOT)/runtime/include
 BUILD_DIR := $(SW_ROOT)/build/chipyard-baremetal
-SIMULATOR ?= $(CHIPYARD_ROOT)/sims/verilator/simulator-chipyard.harness-BiRaRocketConfig
+SIMULATOR ?= $(CHIPYARD_ROOT)/sims/verilator/simulator-chipyard.harness-AccelRocketConfig
 
 TESTS := bira_status bira_dma_loopback bira_dense_1x1 bira_binary_1x1
 ELFS := $(addprefix $(BUILD_DIR)/,$(addsuffix .riscv,$(TESTS)))

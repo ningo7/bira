@@ -10,14 +10,14 @@ import chisel3.util.log2Ceil
   * dimensions, precisions, signedness, and base addresses are carried by
   * ConvolutionCommand; structural maxima remain static.
   */
-case class BiRaParams(
+case class AccelParams(
   dim: Int = 16,
   activationBits: Int = 8,
   weightBits: Int = 16,
   accumulatorBits: Int = 32,
   fullBanks: Int = 10,
   binaryBanks: Int = 4,
-  accumulatorBanks: Int = 2,
+  accumulatorBanks: Int = 1,
   bankRows: Int = 1024,
   parameterRows: Int = 512,
   // Includes the x4 high-resolution tail/final stages. Low-resolution
@@ -32,7 +32,7 @@ case class BiRaParams(
   maxShuffleScale: Int = 4,
   nContexts: Int = 4,
   contextIdBits: Int = 3,
-  reservationStationEntries: Int = 8,
+  rsEntries: Int = 8,
   loadQueueEntries: Int = 4,
   execQueueEntries: Int = 4,
   storeQueueEntries: Int = 4,
@@ -58,7 +58,7 @@ case class BiRaParams(
   require(maxShuffleScale >= 2 && isPowerOfTwo(maxShuffleScale))
   require(nContexts > 0 && nContexts <= (1 << contextIdBits))
   require(contextIdBits > 0)
-  require(reservationStationEntries > 0)
+  require(rsEntries > 0)
   require(loadQueueEntries > 0)
   require(execQueueEntries > 0)
   require(storeQueueEntries > 0)
@@ -73,6 +73,13 @@ case class BiRaParams(
   val fullRows: Int = fullBanks * bankRows
   val binaryRows: Int = binaryBanks * bankRows
   val accumulatorRows: Int = accumulatorBanks * bankRows
+  // One physical column produces at most one signed W16 value. Lower
+  // precisions reduce several narrower values and binary mode counts 16 bits,
+  // so 16 signed bits cover every normal-column result exactly.
+  val arraySumBits: Int = weightBits
+  // Column-reduce mode sums dim/2 independent signed W16 columns.
+  val columnReduceBits: Int =
+    arraySumBits + log2Ceil((dim / 2) max 1)
 
   val bankRowBits: Int = log2Ceil(bankRows)
   val fullAddressBits: Int = log2Ceil(fullRows)
@@ -104,7 +111,7 @@ case class BiRaParams(
   val shuffleScaleBits: Int = log2Ceil(maxShuffleScale + 1)
   val contextIndexBits: Int = log2Ceil(nContexts max 2)
   val reservationIndexBits: Int =
-    log2Ceil(reservationStationEntries max 2)
+    log2Ceil(rsEntries max 2)
   val dmaBeatOffsetBits: Int = log2Ceil(dmaBeatBytes)
   val pageOffsetBits: Int = log2Ceil(pageBytes)
 

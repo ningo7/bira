@@ -81,7 +81,7 @@ def validate_layout(root: Path, force_untested: bool) -> Path:
         / "main"
         / "scala"
         / "chipyard"
-        / "BiRaConfigs.scala",
+        / "AccelConfigs.scala",
         bira_root() / "sw" / "runtime" / "include" / "bira_rocc.h",
     )
     if not build_file.is_file():

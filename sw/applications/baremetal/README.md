@@ -13,4 +13,4 @@ make run
 make run-bfsrcnn
 ```
 
-默认 RISC-V 工具链来自 `<chipyard>/.conda-env/riscv-tools`，默认 simulator 是 `sims/verilator/simulator-chipyard.harness-BiRaRocketConfig`；可分别用 `RISCV=...` 与 `SIMULATOR=...` 覆盖。CPU 提交 DMA 前和读取 STORE 结果前需要 `fence rw, rw`，BIRA `FENCE` 只保证加速器任务完成，不能替代 CPU 内存屏障。完整流程见[使用指南](../../../docs/getting-started.md)。
+默认 RISC-V 工具链来自 `<chipyard>/.conda-env/riscv-tools`，默认 simulator 是 `sims/verilator/simulator-chipyard.harness-AccelRocketConfig`；可分别用 `RISCV=...` 与 `SIMULATOR=...` 覆盖。CPU 提交 DMA 前和读取 STORE 结果前需要 `fence rw, rw`，BIRA `FENCE` 只保证加速器任务完成，不能替代 CPU 内存屏障。完整流程见[使用指南](../../../docs/getting-started.md)。

@@ -7,26 +7,26 @@ import chisel3.util._
 import _root_.circt.stage.ChiselStage
 
 /** One native 64-byte Parameter Buffer row. */
-class BiRaParameterRowWrite(p: BiRaParams) extends Bundle {
+class ParamWrite(p: AccelParams) extends Bundle {
   val address = UInt(p.parameterAddressBits.W)
   val data = UInt(512.W)
 }
 
 /** Request the parameter records for one 16-lane output block. */
-class BiRaParameterBlockRead(p: BiRaParams) extends Bundle {
+class ParamRead(p: AccelParams) extends Bundle {
   val baseRow = UInt(p.parameterAddressBits.W)
   val block = UInt(p.blockIndexBits.W)
 }
 
 /** Select one packed per-pixel binary correction from a Parameter row. */
-class BiRaCorrectionReadRequest(p: BiRaParams) extends Bundle {
+class CorrectionReq(p: AccelParams) extends Bundle {
   val address = UInt(p.parameterAddressBits.W)
 }
 
 /** Both interpretations are returned; arrayMode selects the consumer. */
-class BiRaDecodedParameterBlock(p: BiRaParams) extends Bundle {
-  val multiBit = new ConvolutionParameterWrite(p)
-  val binary = new BinaryConvolutionParameterWrite(p)
+class DecodedParams(p: AccelParams) extends Bundle {
+  val multiBit = new ConvParamWrite(p)
+  val binary = new BinParamWrite(p)
 }
 
 /** DMA-writable raw Parameter Buffer with decoded and packed-table reads.
@@ -36,7 +36,7 @@ class BiRaDecodedParameterBlock(p: BiRaParams) extends Bundle {
   * frozen record layouts over the same raw storage. A separate row range may
   * pack 16 per-pixel signed-int32 binary corrections into each 512-bit row.
   */
-class BiRaParameterBuffer(p: BiRaParams) extends Module {
+class ParamBuffer(p: AccelParams) extends Module {
   require(p.dim % 2 == 0, "parameter rows contain exactly two lane records")
   require(
     512 % p.accumulatorBits == 0 &&
@@ -49,12 +49,12 @@ class BiRaParameterBuffer(p: BiRaParams) extends Module {
   )
 
   val io = IO(new Bundle {
-    val write = Flipped(Decoupled(new BiRaParameterRowWrite(p)))
+    val write = Flipped(Decoupled(new ParamWrite(p)))
     val readRequest =
-      Flipped(Decoupled(new BiRaParameterBlockRead(p)))
-    val readResponse = Decoupled(new BiRaDecodedParameterBlock(p))
+      Flipped(Decoupled(new ParamRead(p)))
+    val readResponse = Decoupled(new DecodedParams(p))
     val correctionReadRequest =
-      Flipped(Decoupled(new BiRaCorrectionReadRequest(p)))
+      Flipped(Decoupled(new CorrectionReq(p)))
     val correctionReadResponse =
       Decoupled(UInt(512.W))
   })
@@ -64,7 +64,7 @@ class BiRaParameterBuffer(p: BiRaParams) extends Module {
     Vec(p.parameterRowsPerBlock, UInt(512.W))
   )
   private val request =
-    Reg(new BiRaParameterBlockRead(p))
+    Reg(new ParamRead(p))
   private val correctionAddress =
     Reg(UInt(p.parameterAddressBits.W))
   private val correctionValue =
@@ -154,7 +154,7 @@ class BiRaParameterBuffer(p: BiRaParams) extends Module {
   }
 
   private val decoded =
-    WireDefault(0.U.asTypeOf(new BiRaDecodedParameterBlock(p)))
+    WireDefault(0.U.asTypeOf(new DecodedParams(p)))
   decoded.multiBit.block := request.block
   decoded.binary.block := request.block
 
@@ -230,11 +230,11 @@ class BiRaParameterBuffer(p: BiRaParams) extends Module {
   }
 }
 
-object GenBiRaParameterBuffer extends App {
+object GenParamBuffer extends App {
   private val targetDir =
     args.headOption.getOrElse("build/generated-rtl")
   ChiselStage.emitSystemVerilogFile(
-    new BiRaParameterBuffer(BiRaParams(dim = 4, maxOutputBlocks = 4)),
+    new ParamBuffer(AccelParams(dim = 4, maxOutputBlocks = 4)),
     args = Array("--target-dir", targetDir),
     firtoolOpts = Array("-disable-all-randomization", "-strip-debug-info")
   )

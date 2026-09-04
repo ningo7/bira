@@ -5,8 +5,8 @@ import chisel3.simulator.EphemeralSimulator._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
-class BiRaDmaSpec extends AnyFreeSpec with Matchers {
-  private val p = BiRaParams(
+class DmaSpec extends AnyFreeSpec with Matchers {
+  private val p = AccelParams(
     dim = 16,
     fullBanks = 4,
     binaryBanks = 2,
@@ -21,7 +21,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
   )
 
   private def initializeContext(
-    context: BiRaContext,
+    context: Context,
     inputBase: Int = 16,
     outputFullBase: Int = 32,
     outputBinaryBase: Int = 8
@@ -41,28 +41,28 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
     context.kernelWidth.poke(1.U)
     context.paddingHeight.poke(0.U)
     context.paddingWidth.poke(0.U)
-    context.addressValid.poke(((1 << BiRaAddrRole.count) - 1).U)
-    for (role <- 0 until BiRaAddrRole.count) {
+    context.addressValid.poke(((1 << AddrRole.count) - 1).U)
+    for (role <- 0 until AddrRole.count) {
       context.baseRows(role).poke(0.U)
     }
-    context.baseRows(BiRaAddrRole.input).poke(inputBase.U)
-    context.baseRows(BiRaAddrRole.outputFull).poke(outputFullBase.U)
-    context.baseRows(BiRaAddrRole.outputBinary)
+    context.baseRows(AddrRole.input).poke(inputBase.U)
+    context.baseRows(AddrRole.outputFull).poke(outputFullBase.U)
+    context.baseRows(AddrRole.outputBinary)
       .poke(outputBinaryBase.U)
-    context.arrayMode.poke(BiRaArrayMode.dense.U)
-    context.weightPrecision.poke(BiRaWeightPrecision.w16.U)
+    context.arrayMode.poke(ArrayMode.dense.U)
+    context.weightPrecision.poke(WgtPrecision.w16.U)
     context.inputSigned.poke(false.B)
-    context.postMode.poke(BiRaPostMode.intRelu.U)
+    context.postMode.poke(PostMode.intRelu.U)
     context.shufflePack2.poke(false.B)
     context.writeFull.poke(true.B)
     context.writeBinary.poke(false.B)
     context.inflightCount.poke(1.U)
-    context.errorCode.poke(BiRaError.none.U)
+    context.errorCode.poke(ErrorCode.none.U)
     context.errorCommandSequence.poke(0.U)
   }
 
   private def pokeTask(
-    task: BiRaDmaTask,
+    task: DmaTask,
     role: Int,
     virtualAddress: BigInt,
     rows: Int,
@@ -85,7 +85,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
   }
 
   "LOAD_2D walks both strides, zero-fills a short row, and rejects width errors" in {
-    simulate(new BiRaLoadCtrl(p)) { dut =>
+    simulate(new LoadCtrl(p)) { dut =>
       dut.reset.poke(true.B)
       for (index <- 0 until p.nContexts) {
         initializeContext(dut.io.contexts(index))
@@ -100,7 +100,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
 
       pokeTask(
         dut.io.task.bits,
-        role = BiRaAddrRole.input,
+        role = AddrRole.input,
         virtualAddress = 0x1000,
         rows = 2,
         bytes = 4,
@@ -113,6 +113,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
       dut.io.task.ready.expect(true.B)
       dut.clock.step()
       dut.io.task.valid.poke(false.B)
+      dut.clock.step() // pipelined descriptor range validation
 
       def returnExternalRow(expectedAddress: BigInt, data: BigInt): Unit = {
         dut.io.externalRequest.valid.expect(true.B)
@@ -123,7 +124,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
         dut.clock.step()
 
         dut.io.externalResponse.bits.data.poke(data.U)
-        dut.io.externalResponse.bits.errorCode.poke(BiRaError.none.U)
+        dut.io.externalResponse.bits.errorCode.poke(ErrorCode.none.U)
         dut.io.externalResponse.valid.poke(true.B)
         dut.io.externalResponse.ready.expect(true.B)
         dut.clock.step()
@@ -135,7 +136,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
         data = (BigInt(1) << 512) - 1
       )
       dut.io.localWrite.valid.expect(true.B)
-      dut.io.localWrite.bits.memory.expect(BiRaLocalMemory.full.U)
+      dut.io.localWrite.bits.memory.expect(LocalMem.full.U)
       dut.io.localWrite.bits.address.expect(17.U)
       dut.io.localWrite.bits.data.expect(BigInt("ffffffff", 16).U)
       dut.clock.step()
@@ -152,7 +153,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
       dut.io.completion.valid.expect(true.B)
       dut.io.completion.bits.contextId.expect(0.U)
       dut.io.completion.bits.commandSequence.expect(7.U)
-      dut.io.completion.bits.errorCode.expect(BiRaError.none.U)
+      dut.io.completion.bits.errorCode.expect(ErrorCode.none.U)
       dut.io.completion.ready.poke(true.B)
       dut.clock.step()
       dut.io.completion.ready.poke(false.B)
@@ -160,7 +161,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
       // A Binary SPAD row is only two bytes.
       pokeTask(
         dut.io.task.bits,
-        role = BiRaAddrRole.outputBinary,
+        role = AddrRole.outputBinary,
         virtualAddress = 0x2000,
         rows = 1,
         bytes = 3,
@@ -173,15 +174,16 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
       dut.io.task.ready.expect(true.B)
       dut.clock.step()
       dut.io.task.valid.poke(false.B)
+      dut.clock.step() // pipelined descriptor range validation
       dut.io.externalRequest.valid.expect(false.B)
       dut.io.completion.valid.expect(true.B)
       dut.io.completion.bits.commandSequence.expect(8.U)
-      dut.io.completion.bits.errorCode.expect(BiRaError.rowTooWide.U)
+      dut.io.completion.bits.errorCode.expect(ErrorCode.rowTooWide.U)
     }
   }
 
   "STORE_2D waits for local data and every external write response" in {
-    simulate(new BiRaStoreCtrl(p)) { dut =>
+    simulate(new StoreCtrl(p)) { dut =>
       dut.reset.poke(true.B)
       for (index <- 0 until p.nContexts) {
         initializeContext(dut.io.contexts(index))
@@ -197,7 +199,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
 
       pokeTask(
         dut.io.task.bits,
-        role = BiRaAddrRole.outputFull,
+        role = AddrRole.outputFull,
         virtualAddress = 0x3000,
         rows = 2,
         bytes = 3,
@@ -210,6 +212,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
       dut.io.task.ready.expect(true.B)
       dut.clock.step()
       dut.io.task.valid.poke(false.B)
+      dut.clock.step() // pipelined descriptor range validation
 
       def provideLocalRow(
         expectedAddress: Int,
@@ -217,13 +220,13 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
       ): Unit = {
         dut.io.localReadRequest.valid.expect(true.B)
         dut.io.localReadRequest.bits.memory
-          .expect(BiRaLocalMemory.full.U)
+          .expect(LocalMem.full.U)
         dut.io.localReadRequest.bits.address
           .expect(expectedAddress.U)
         dut.clock.step()
 
         dut.io.localReadResponse.bits.data.poke(data.U)
-        dut.io.localReadResponse.bits.errorCode.poke(BiRaError.none.U)
+        dut.io.localReadResponse.bits.errorCode.poke(ErrorCode.none.U)
         dut.io.localReadResponse.valid.poke(true.B)
         dut.clock.step()
         dut.io.localReadResponse.valid.poke(false.B)
@@ -242,7 +245,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
 
         // Completion must wait for the actual external write response.
         dut.io.completion.valid.expect(false.B)
-        dut.io.externalResponse.bits.errorCode.poke(BiRaError.none.U)
+        dut.io.externalResponse.bits.errorCode.poke(ErrorCode.none.U)
         dut.io.externalResponse.valid.poke(true.B)
         dut.io.externalResponse.ready.expect(true.B)
         dut.clock.step()
@@ -256,7 +259,7 @@ class BiRaDmaSpec extends AnyFreeSpec with Matchers {
 
       dut.io.completion.valid.expect(true.B)
       dut.io.completion.bits.commandSequence.expect(11.U)
-      dut.io.completion.bits.errorCode.expect(BiRaError.none.U)
+      dut.io.completion.bits.errorCode.expect(ErrorCode.none.U)
       dut.io.completion.ready.poke(true.B)
       dut.clock.step()
       dut.io.busy.expect(false.B)

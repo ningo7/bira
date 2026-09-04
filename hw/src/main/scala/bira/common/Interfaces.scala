@@ -9,6 +9,33 @@ object AccumulatorOperation extends ChiselEnum {
   val write, add, read = Value
 }
 
+/** One-entry elastic pipeline register.
+  *
+  * Unlike a work queue this holds only the item crossing a pipeline boundary.
+  * Simultaneous consume/replace is supported, so a ready downstream preserves
+  * an initiation interval of one cycle.
+  */
+class ElasticRegister[T <: Data](gen: T) extends Module {
+  val io = IO(new Bundle {
+    val enq = Flipped(Decoupled(gen))
+    val deq = Decoupled(gen)
+  })
+
+  private val full = RegInit(false.B)
+  private val data = Reg(gen)
+
+  io.enq.ready := !full || io.deq.ready
+  io.deq.valid := full
+  io.deq.bits := data
+
+  when(io.enq.fire) {
+    data := io.enq.bits
+  }
+  when(io.enq.fire =/= io.deq.fire) {
+    full := io.enq.fire
+  }
+}
+
 /** Temporary standalone command for a stride-one multi-bit convolution.
   *
   * Address units are vector rows, not bytes. A full-scratchpad row contains
@@ -17,7 +44,7 @@ object AccumulatorOperation extends ChiselEnum {
   * Runtime fields describe the convolution rather than naming a network layer.
   * Output channels are padded to `dim`-lane blocks in scratchpad storage.
   */
-class ConvolutionCommand(p: BiRaParams) extends Bundle {
+class ConvolutionCommand(p: AccelParams) extends Bundle {
   val inputBase = UInt(p.fullAddressBits.W)
   val weightLowBase = UInt(p.fullAddressBits.W)
   val weightHighBase = UInt(p.fullAddressBits.W)
@@ -59,12 +86,14 @@ class ConvolutionCommand(p: BiRaParams) extends Bundle {
   * one vector row contains `dim` consecutive pixels. `outputStartPixel`
   * identifies the first high-resolution pixel returned in the vector.
   */
-class BilinearInterpolationRequest(p: BiRaParams) extends Bundle {
+class InterpReq(p: AccelParams) extends Bundle {
   val inputBase = UInt(p.fullAddressBits.W)
   val inputHeight = UInt(p.imageDimensionBits.W)
   val inputWidth = UInt(p.imageDimensionBits.W)
   val outputWidth = UInt(p.imageDimensionBits.W)
   val outputStartPixel = UInt(p.pixelIndexBits.W)
+  val outputStartX = UInt(p.imageDimensionBits.W)
+  val outputStartY = UInt(p.imageDimensionBits.W)
   val outputPixelCount = UInt((p.pixelIndexBits + 1).W)
   val scaleLog2 = UInt(p.shuffleLogBits.W)
 }
@@ -80,7 +109,7 @@ class BilinearInterpolationRequest(p: BiRaParams) extends Bundle {
   * row packs multiple per-pixel `-N` values. The accumulator starts from zero
   * and holds `2 * popcount`; post-processing adds the selected `-N`.
   */
-class BinaryConvolutionCommand(p: BiRaParams) extends Bundle {
+class BinaryConvolutionCommand(p: AccelParams) extends Bundle {
   val inputBase = UInt(p.binaryAddressBits.W)
   val weightBase = UInt(p.binaryAddressBits.W)
   val binaryOutputBase = UInt(p.binaryAddressBits.W)
@@ -111,36 +140,49 @@ class VectorWriteRequest(
   val data = Vec(lanes, UInt(elementBits.W))
 }
 
-class ActivationFetchRequest(p: BiRaParams) extends Bundle {
+class ActivationFetchRequest(p: AccelParams) extends Bundle {
   val address = UInt(p.fullAddressBits.W)
   val lane = UInt(p.laneIndexBits.W)
 }
 
-class ActivationFetchResponse(p: BiRaParams) extends Bundle {
+class ActivationFetchResponse(p: AccelParams) extends Bundle {
   val activation = UInt(p.activationBits.W)
   val row = Vec(p.dim, UInt(p.activationBits.W))
 }
 
-class WeightFetchRequest(p: BiRaParams) extends Bundle {
+class WeightFetchRequest(p: AccelParams) extends Bundle {
   val lowAddress = UInt(p.fullAddressBits.W)
   val highAddress = UInt(p.fullAddressBits.W)
   val highBytePresent = Bool()
 }
 
-class WeightFetchResponse(p: BiRaParams) extends Bundle {
+class WeightFetchResponse(p: AccelParams) extends Bundle {
   val weights = Vec(p.dim, UInt(p.weightBits.W))
 }
 
-class AccumulatorRequest(p: BiRaParams) extends Bundle {
+class AccumulatorRequest(p: AccelParams) extends Bundle {
   val operation = AccumulatorOperation()
   val address = UInt(p.accumulatorAddressBits.W)
   val data = Vec(p.dim, SInt(p.accumulatorBits.W))
   val shift = UInt(p.activationBitIndexBits.W)
   val negate = Bool()
+  // Opaque controller metadata returned with the ordered response. Keeping
+  // the tag beside the SRAM request removes the controller's one-outstanding
+  // transaction state machine without adding a separate tag FIFO.
+  val completesOutput = Bool()
+  val block = UInt(p.blockIndexBits.W)
+  val pixel = UInt(p.pixelIndexBits.W)
+  val outputX = UInt(p.imageDimensionBits.W)
+  val outputY = UInt(p.imageDimensionBits.W)
 }
 
-class AccumulatorResponse(p: BiRaParams) extends Bundle {
+class AccumulatorResponse(p: AccelParams) extends Bundle {
   val data = Vec(p.dim, SInt(p.accumulatorBits.W))
+  val completesOutput = Bool()
+  val block = UInt(p.blockIndexBits.W)
+  val pixel = UInt(p.pixelIndexBits.W)
+  val outputX = UInt(p.imageDimensionBits.W)
+  val outputY = UInt(p.imageDimensionBits.W)
 }
 
 /** Per-channel parameters for the exact integer PReLU used by the reference C.
@@ -151,7 +193,7 @@ class AccumulatorResponse(p: BiRaParams) extends Bundle {
   *   shiftInteger(coeff1 * (x << left1) +
   *                coeff2 * (x << left2), commonShift)
   */
-class PostProcessParameters(p: BiRaParams) extends Bundle {
+class PostProcessParameters(p: AccelParams) extends Bundle {
   val positiveShift = SInt(p.shiftBits.W)
   val negativeCoeff1 = SInt(2.W)
   val negativeCoeff2 = SInt(2.W)
@@ -162,7 +204,7 @@ class PostProcessParameters(p: BiRaParams) extends Bundle {
   val qMax = SInt(p.accumulatorBits.W)
 }
 
-class ConvolutionParameterWrite(p: BiRaParams) extends Bundle {
+class ConvParamWrite(p: AccelParams) extends Bundle {
   val block = UInt(p.blockIndexBits.W)
   val bias = Vec(p.dim, SInt(p.accumulatorBits.W))
   val post = Vec(p.dim, new PostProcessParameters(p))
@@ -170,7 +212,7 @@ class ConvolutionParameterWrite(p: BiRaParams) extends Bundle {
 }
 
 /** One vector row used to preload compiler-derived accumulator constants. */
-class AccumulatorProgrammingWrite(p: BiRaParams) extends Bundle {
+class AccProgWrite(p: AccelParams) extends Bundle {
   val address = UInt(p.accumulatorAddressBits.W)
   val data = Vec(p.dim, SInt(p.accumulatorBits.W))
 }
@@ -187,7 +229,7 @@ class AccumulatorProgrammingWrite(p: BiRaParams) extends Bundle {
   *
   * Positive coeff1 is always +1 in the exported format.
   */
-class BinaryPostProcessParameters(p: BiRaParams) extends Bundle {
+class BinPostParams(p: AccelParams) extends Bundle {
   val threshold = SInt(p.accumulatorBits.W)
 
   val positiveCoeff2 = SInt(2.W)
@@ -207,9 +249,9 @@ class BinaryPostProcessParameters(p: BiRaParams) extends Bundle {
   val qMax = SInt(p.accumulatorBits.W)
 }
 
-class BinaryConvolutionParameterWrite(p: BiRaParams) extends Bundle {
+class BinParamWrite(p: AccelParams) extends Bundle {
   val block = UInt(p.blockIndexBits.W)
-  val post = Vec(p.dim, new BinaryPostProcessParameters(p))
+  val post = Vec(p.dim, new BinPostParams(p))
   /** Threshold used to prepare the next binary layer's input. */
   val outputSignThreshold =
     Vec(p.dim, SInt(p.accumulatorBits.W))

@@ -7,13 +7,13 @@ import chisel3.simulator.EphemeralSimulator._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
-class BfsrcnnShrink1Spec extends AnyFreeSpec with Matchers {
+class Shrink1Spec extends AnyFreeSpec with Matchers {
   "generic convolution control must execute signed-A8 W4 48-to-32 pointwise convolution" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 16,
       fullBanks = 5,
       binaryBanks = 2,
-      accumulatorBanks = 2,
+      accumulatorBanks = 1,
       bankRows = 128,
       maxImageHeight = 2,
       maxImageWidth = 2,
@@ -71,7 +71,7 @@ class BfsrcnnShrink1Spec extends AnyFreeSpec with Matchers {
     val unusedWeightHighBase = 2 * p.bankRows
     val outputBase = 3 * p.bankRows
 
-    simulate(new BiRaCore(p)) { dut =>
+    simulate(new Core(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.command.valid.poke(false.B)
       dut.io.binaryCommand.valid.poke(false.B)

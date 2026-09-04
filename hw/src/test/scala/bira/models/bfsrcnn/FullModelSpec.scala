@@ -17,7 +17,7 @@ import scala.collection.mutable
   * SPAD mappings, binary/full ping-pong, PixelShuffle, bilinear residual, and
   * final STORE follow docs/models/bfsrcnn.md.
   */
-class BfsrcnnStandaloneFullModelSpec
+class FullModelSpec
     extends AnyFreeSpec
     with Matchers {
 
@@ -159,11 +159,11 @@ class BfsrcnnStandaloneFullModelSpec
   }
 
   "standalone ISA and DRAM shell must execute the complete BFSRCNN topology" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 16,
       fullBanks = 10,
       binaryBanks = 4,
-      accumulatorBanks = 2,
+      accumulatorBanks = 1,
       bankRows = 512,
       parameterRows = 512,
       maxImageHeight = 4,
@@ -245,12 +245,12 @@ class BfsrcnnStandaloneFullModelSpec
 
     val f = Array.tabulate(10)(_ * p.bankRows)
     val b = Array.tabulate(4)(_ * p.bankRows)
-    val a = Array.tabulate(2)(_ * p.bankRows)
+    val accumulatorBase = 0
     val originalInputBase = f(9) + 256
     val parameterBase = 0
     val correctionBase = 256
 
-    simulate(new BiRaStandaloneTop(p)) { dut =>
+    simulate(new StandaloneTop(p)) { dut =>
       var cycleCount = 0L
       val maxCycles = 1000000L
       var readResponse: Option[BigInt] = None
@@ -277,9 +277,9 @@ class BfsrcnnStandaloneFullModelSpec
         dut.io.dramReadResponse.bits.data.poke(
           readResponse.getOrElse(BigInt(0)).U
         )
-        dut.io.dramReadResponse.bits.errorCode.poke(BiRaError.none.U)
+        dut.io.dramReadResponse.bits.errorCode.poke(ErrorCode.none.U)
         dut.io.dramWriteResponse.valid.poke(writeResponsePending.B)
-        dut.io.dramWriteResponse.bits.errorCode.poke(BiRaError.none.U)
+        dut.io.dramWriteResponse.bits.errorCode.poke(ErrorCode.none.U)
 
         val commandFire =
           dut.io.command.valid.peek().litToBoolean &&
@@ -410,7 +410,7 @@ class BfsrcnnStandaloneFullModelSpec
             (BigInt(kernelWidth) << 28) |
             (BigInt(paddingHeight) << 32) |
             (BigInt(paddingWidth) << 36)
-        send(BiRaFunct.cfgShape, rs1, rs2)
+        send(Funct.cfgShape, rs1, rs2)
       }
 
       def cfgAddress(context: Int, role: Int, baseRow: Int): Unit = {
@@ -418,7 +418,7 @@ class BfsrcnnStandaloneFullModelSpec
           BigInt(context) |
             (BigInt(role) << 3) |
             (BigInt(baseRow) << 7)
-        send(BiRaFunct.cfgAddr, packed, 0)
+        send(Funct.cfgAddr, packed, 0)
       }
 
       def cfgMode(
@@ -440,7 +440,7 @@ class BfsrcnnStandaloneFullModelSpec
             (if (shufflePack2) BigInt(1) << 11 else BigInt(0)) |
             (if (writeFull) BigInt(1) << 12 else BigInt(0)) |
             (if (writeBinary) BigInt(1) << 13 else BigInt(0))
-        send(BiRaFunct.cfgMode, packed, 0)
+        send(Funct.cfgMode, packed, 0)
       }
 
       def configure(
@@ -476,28 +476,28 @@ class BfsrcnnStandaloneFullModelSpec
           padding,
           padding
         )
-        cfgAddress(context, BiRaAddrRole.input, addresses.input)
-        cfgAddress(context, BiRaAddrRole.weightLow, addresses.weightLow)
+        cfgAddress(context, AddrRole.input, addresses.input)
+        cfgAddress(context, AddrRole.weightLow, addresses.weightLow)
         addresses.weightHigh.foreach(row =>
-          cfgAddress(context, BiRaAddrRole.weightHigh, row)
+          cfgAddress(context, AddrRole.weightHigh, row)
         )
-        cfgAddress(context, BiRaAddrRole.parameter, addresses.parameter)
+        cfgAddress(context, AddrRole.parameter, addresses.parameter)
         addresses.residual.foreach(row =>
-          cfgAddress(context, BiRaAddrRole.residual, row)
+          cfgAddress(context, AddrRole.residual, row)
         )
         addresses.correction.foreach(row =>
-          cfgAddress(context, BiRaAddrRole.correction, row)
+          cfgAddress(context, AddrRole.correction, row)
         )
         cfgAddress(
           context,
-          BiRaAddrRole.accumulator,
+          AddrRole.accumulator,
           addresses.accumulator
         )
         addresses.outputFull.foreach(row =>
-          cfgAddress(context, BiRaAddrRole.outputFull, row)
+          cfgAddress(context, AddrRole.outputFull, row)
         )
         addresses.outputBinary.foreach(row =>
-          cfgAddress(context, BiRaAddrRole.outputBinary, row)
+          cfgAddress(context, AddrRole.outputBinary, row)
         )
         cfgMode(
           context,
@@ -509,7 +509,7 @@ class BfsrcnnStandaloneFullModelSpec
           writeFull,
           writeBinary
         )
-        send(BiRaFunct.cfgCommit, context, 0)
+        send(Funct.cfgCommit, context, 0)
       }
 
       def dmaDescriptor(context: Int, role: Int, blob: Blob): BigInt =
@@ -523,24 +523,24 @@ class BfsrcnnStandaloneFullModelSpec
 
       def load(context: Int, role: Int, blob: Blob): Unit =
         send(
-          BiRaFunct.load2d,
+          Funct.load2d,
           blob.address,
           dmaDescriptor(context, role, blob)
         )
 
       def execute(context: Int): Unit =
-        send(BiRaFunct.execConv, context, 0)
+        send(Funct.execConv, context, 0)
 
       def fence(context: Int): Unit = {
         send(
-          BiRaFunct.fence,
+          Funct.fence,
           BigInt(1) | (BigInt(context) << 1),
           0,
           returnsValue = true
         )
         val result = awaitResponse()
         (result & 1) mustBe 1
-        ((result >> 1) & 0xff) mustBe BiRaError.none
+        ((result >> 1) & 0xff) mustBe ErrorCode.none
       }
 
       def runLayer(
@@ -557,8 +557,8 @@ class BfsrcnnStandaloneFullModelSpec
       reset()
 
       // The standalone top acknowledges TLB_FLUSH without a Rocket TLB.
-      send(BiRaFunct.tlbFlush, 0, 0, returnsValue = true)
-      awaitResponse() mustBe BiRaError.none
+      send(Funct.tlbFlush, 0, 0, returnsValue = true)
+      awaitResponse() mustBe ErrorCode.none
 
       configure(
         context = 0,
@@ -578,22 +578,22 @@ class BfsrcnnStandaloneFullModelSpec
           parameterBase,
           None,
           None,
-          a(1),
+          accumulatorBase,
           Some(f(1)),
           None
         ),
-        arrayMode = BiRaArrayMode.dense,
-        weightPrecision = BiRaWeightPrecision.w16,
+        arrayMode = ArrayMode.dense,
+        weightPrecision = WgtPrecision.w16,
         inputSigned = false,
-        postMode = BiRaPostMode.intPrelu
+        postMode = PostMode.intPrelu
       )
       runLayer(
         0,
         Seq(
-          BiRaAddrRole.input -> input,
-          BiRaAddrRole.weightLow -> headWeightLow,
-          BiRaAddrRole.weightHigh -> headWeightHigh,
-          BiRaAddrRole.parameter -> headParameters
+          AddrRole.input -> input,
+          AddrRole.weightLow -> headWeightLow,
+          AddrRole.weightHigh -> headWeightHigh,
+          AddrRole.parameter -> headParameters
         )
       )
 
@@ -615,20 +615,20 @@ class BfsrcnnStandaloneFullModelSpec
           parameterBase,
           None,
           None,
-          a(1),
+          accumulatorBase,
           Some(f(4)),
           None
         ),
-        arrayMode = BiRaArrayMode.dense,
-        weightPrecision = BiRaWeightPrecision.w4,
+        arrayMode = ArrayMode.dense,
+        weightPrecision = WgtPrecision.w4,
         inputSigned = true,
-        postMode = BiRaPostMode.intRelu
+        postMode = PostMode.intRelu
       )
       runLayer(
         1,
         Seq(
-          BiRaAddrRole.weightLow -> shrink1Weight,
-          BiRaAddrRole.parameter -> shrink1Parameters
+          AddrRole.weightLow -> shrink1Weight,
+          AddrRole.parameter -> shrink1Parameters
         )
       )
 
@@ -650,21 +650,21 @@ class BfsrcnnStandaloneFullModelSpec
           parameterBase,
           None,
           None,
-          a(1),
+          accumulatorBase,
           Some(f(6)),
           None
         ),
-        arrayMode = BiRaArrayMode.depthwise,
-        weightPrecision = BiRaWeightPrecision.w16,
+        arrayMode = ArrayMode.depthwise,
+        weightPrecision = WgtPrecision.w16,
         inputSigned = false,
-        postMode = BiRaPostMode.intRelu
+        postMode = PostMode.intRelu
       )
       runLayer(
         2,
         Seq(
-          BiRaAddrRole.weightLow -> shrink2WeightLow,
-          BiRaAddrRole.weightHigh -> shrink2WeightHigh,
-          BiRaAddrRole.parameter -> shrink2Parameters
+          AddrRole.weightLow -> shrink2WeightLow,
+          AddrRole.weightHigh -> shrink2WeightHigh,
+          AddrRole.parameter -> shrink2Parameters
         )
       )
 
@@ -686,21 +686,21 @@ class BfsrcnnStandaloneFullModelSpec
           parameterBase,
           None,
           None,
-          a(1),
+          accumulatorBase,
           Some(f(0)),
           Some(b(0))
         ),
-        arrayMode = BiRaArrayMode.dense,
-        weightPrecision = BiRaWeightPrecision.w8,
+        arrayMode = ArrayMode.dense,
+        weightPrecision = WgtPrecision.w8,
         inputSigned = false,
-        postMode = BiRaPostMode.intSignedSign,
+        postMode = PostMode.intSignedSign,
         writeBinary = true
       )
       runLayer(
         3,
         Seq(
-          BiRaAddrRole.weightLow -> shrink3WeightLow,
-          BiRaAddrRole.parameter -> shrink3Parameters
+          AddrRole.weightLow -> shrink3WeightLow,
+          AddrRole.parameter -> shrink3Parameters
         )
       )
 
@@ -725,25 +725,25 @@ class BfsrcnnStandaloneFullModelSpec
             parameterBase,
             Some(if (even) f(0) else f(1)),
             Some(correctionBase),
-            a(1),
+            accumulatorBase,
             Some(if (even) f(1) else f(0)),
             if (mapping != 7) Some(if (even) b(1) else b(0))
             else None
           ),
-          arrayMode = BiRaArrayMode.binary,
-          weightPrecision = BiRaWeightPrecision.w2,
+          arrayMode = ArrayMode.binary,
+          weightPrecision = WgtPrecision.w2,
           inputSigned = false,
-          postMode = BiRaPostMode.binaryFused,
+          postMode = PostMode.binaryFused,
           writeBinary = mapping != 7
         )
         val commonLoads =
           Seq(
-            BiRaAddrRole.weightLow -> mappingWeights(mapping),
-            BiRaAddrRole.parameter -> mappingParameters(mapping)
+            AddrRole.weightLow -> mappingWeights(mapping),
+            AddrRole.parameter -> mappingParameters(mapping)
           )
         val loads =
           if (mapping == 0)
-            commonLoads :+ (BiRaAddrRole.correction -> correction)
+            commonLoads :+ (AddrRole.correction -> correction)
           else commonLoads
         runLayer(context, loads)
       }
@@ -766,21 +766,21 @@ class BfsrcnnStandaloneFullModelSpec
           parameterBase,
           None,
           None,
-          a(1),
+          accumulatorBase,
           Some(f(1)),
           None
         ),
-        arrayMode = BiRaArrayMode.dense,
-        weightPrecision = BiRaWeightPrecision.w8,
+        arrayMode = ArrayMode.dense,
+        weightPrecision = WgtPrecision.w8,
         inputSigned = true,
-        postMode = BiRaPostMode.intPrelu,
+        postMode = PostMode.intPrelu,
         shufflePack2 = true
       )
       runLayer(
         0,
         Seq(
-          BiRaAddrRole.weightLow -> expandWeightLow,
-          BiRaAddrRole.parameter -> expandParameters
+          AddrRole.weightLow -> expandWeightLow,
+          AddrRole.parameter -> expandParameters
         )
       )
 
@@ -802,35 +802,35 @@ class BfsrcnnStandaloneFullModelSpec
           parameterBase,
           Some(originalInputBase),
           None,
-          a(1),
+          accumulatorBase,
           Some(f(0)),
           None
         ),
-        arrayMode = BiRaArrayMode.columnReduce,
-        weightPrecision = BiRaWeightPrecision.w16,
+        arrayMode = ArrayMode.columnReduce,
+        weightPrecision = WgtPrecision.w16,
         inputSigned = true,
-        postMode = BiRaPostMode.finalBilinearResidual
+        postMode = PostMode.finalBilinearResidual
       )
       runLayer(
         1,
         Seq(
-          BiRaAddrRole.weightLow -> finalWeightLow,
-          BiRaAddrRole.weightHigh -> finalWeightHigh,
-          BiRaAddrRole.parameter -> finalParameters
+          AddrRole.weightLow -> finalWeightLow,
+          AddrRole.weightHigh -> finalWeightHigh,
+          AddrRole.parameter -> finalParameters
         )
       )
 
       val outputBlob = Blob(outputAddress, rows = 1, bytesPerRow = 16)
       send(
-        BiRaFunct.store2d,
+        Funct.store2d,
         outputAddress,
-        dmaDescriptor(1, BiRaAddrRole.outputFull, outputBlob)
+        dmaDescriptor(1, AddrRole.outputFull, outputBlob)
       )
       fence(1)
 
       dram.readBytes(outputAddress, 16) mustBe Seq.fill(16)(7)
 
-      send(BiRaFunct.status, 0, 0, returnsValue = true)
+      send(Funct.status, 0, 0, returnsValue = true)
       val globalStatus = awaitResponse()
       ((globalStatus >> 6) & 1) mustBe 0
       dut.io.busy.expect(false.B)

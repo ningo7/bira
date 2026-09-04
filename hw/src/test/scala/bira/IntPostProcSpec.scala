@@ -8,7 +8,7 @@ import org.scalatest.matchers.must.Matchers
 /** Unit tests for multi-bit post-processing. */
 class IntPostProcSpec extends AnyFreeSpec with Matchers {
   "PReLU must match symmetric rounded shifts and signed saturation" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 4,
       bankRows = 16,
       maxImageHeight = 2,
@@ -41,7 +41,9 @@ class IntPostProcSpec extends AnyFreeSpec with Matchers {
       dut.io.inputValid.poke(true.B)
       dut.clock.step()
       dut.io.inputValid.poke(false.B)
-      dut.clock.step()
+      while (!dut.io.outputValid.peek().litToBoolean) {
+        dut.clock.step()
+      }
       dut.io.outputValid.expect(true.B)
       val expected = Seq(14, -4, 31, -32)
       for (lane <- 0 until p.dim) {

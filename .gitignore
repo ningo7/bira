@@ -9,6 +9,7 @@ test_run_dir/
 /hw/project/metals.sbt
 
 docs/
+fpga/
 
 # Native simulation and waveform products
 *.o

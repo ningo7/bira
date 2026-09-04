@@ -8,7 +8,7 @@ import unittest
 BIRA_ROOT = Path(__file__).resolve().parents[1]
 
 
-class BiRaRuntimeTest(unittest.TestCase):
+class RuntimeTest(unittest.TestCase):
     def test_trace_backend_records_portable_command_and_memory_images(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)

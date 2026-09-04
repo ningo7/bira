@@ -261,7 +261,7 @@ static int write_commands(
     const char *path)
 {
     static const uint8_t magic[8] = {
-        'B', 'I', 'N', 'P', 'U', 'C', 'M', 'D'
+        'B', 'I', 'R', 'A', '_', 'C', 'M', 'D'
     };
     FILE *file;
     size_t index;

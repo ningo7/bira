@@ -5,12 +5,20 @@ package bira
 import chisel3._
 import chisel3.util._
 
-/** Two-bank vector accumulator with overwrite, shifted-add, and read commands.
+/** Banked vector accumulator implemented as a pipelined 1R1W memory.
   *
-  * Requests are processed in order. Every accepted request produces exactly
-  * one response, so a controller can use the response as its completion event.
+  * One request may be accepted every cycle. Read and add requests launch the
+  * synchronous read in the acceptance cycle; one cycle later an add writes
+  * its result through the independent write port. Writes use the same
+  * writeback stage, so every operation remains ordered and produces exactly
+  * one response.
+  *
+  * The two response entries are an interface skid buffer, not an execution
+  * queue. They only preserve Decoupled semantics when a consumer briefly
+  * removes ready; with a continuously-ready consumer the initiation interval
+  * is one cycle.
   */
-class VecAccum(p: BiRaParams) extends Module {
+class VecAccum(p: AccelParams) extends Module {
   private val rowBits = p.bankRowBits
   private val rowType = Vec(p.dim, SInt(p.accumulatorBits.W))
 
@@ -21,23 +29,40 @@ class VecAccum(p: BiRaParams) extends Module {
 
   private val memories =
     Seq.fill(p.accumulatorBanks)(SyncReadMem(p.bankRows, rowType))
+  private val pendingValid = RegInit(false.B)
+  private val pending = Reg(new AccumulatorRequest(p))
 
-  private val idle :: waitForRead :: respond :: Nil = Enum(3)
-  private val state = RegInit(idle)
-  private val requestRegister = Reg(new AccumulatorRequest(p))
-  private val responseRegister = Reg(new AccumulatorResponse(p))
+  private val responses = Module(
+    new Queue(new AccumulatorResponse(p), entries = 2, pipe = true, flow = true)
+  )
+  io.response <> responses.io.deq
 
-  io.request.ready := state === idle
-  io.response.valid := state === respond
-  io.response.bits := responseRegister
+  // Reserve one response slot for the request already in the SRAM pipeline.
+  // Account for a same-cycle dequeue so a ready consumer sustains II=1.
+  private val occupiedAfterDequeue =
+    responses.io.count - responses.io.deq.fire.asUInt
+  private val reservedResponses =
+    occupiedAfterDequeue + pendingValid.asUInt
+  private val requestNeedsRead =
+    io.request.bits.operation =/= AccumulatorOperation.write
+  private val pendingWrites =
+    pending.operation =/= AccumulatorOperation.read
+  // SyncReadMem read-during-write data is target-dependent. Stall only a true
+  // same-row dependency; independent rows retain II=1.
+  private val sameRowHazard =
+    pendingValid &&
+      pendingWrites &&
+      requestNeedsRead &&
+      pending.address === io.request.bits.address
+  io.request.ready := reservedResponses < 2.U && !sameRowHazard
 
-  val requestBank = io.request.bits.address >> rowBits
-  val requestRow = io.request.bits.address(rowBits - 1, 0)
-  val startRead = io.request.fire &&
+  private val requestBank = io.request.bits.address >> rowBits
+  private val requestRow = io.request.bits.address(rowBits - 1, 0)
+  private val startRead = io.request.fire &&
     (io.request.bits.operation === AccumulatorOperation.add ||
       io.request.bits.operation === AccumulatorOperation.read)
 
-  val readData = Wire(Vec(p.accumulatorBanks, rowType))
+  private val readData = Wire(Vec(p.accumulatorBanks, rowType))
   for (bank <- 0 until p.accumulatorBanks) {
     readData(bank) := memories(bank).read(
       requestRow,
@@ -47,57 +72,55 @@ class VecAccum(p: BiRaParams) extends Module {
 
   when(io.request.fire) {
     assert(requestBank < p.accumulatorBanks.U, "accumulator address out of range")
-    requestRegister := io.request.bits
-
-    when(io.request.bits.operation === AccumulatorOperation.write) {
-      for (bank <- 0 until p.accumulatorBanks) {
-        when(requestBank === bank.U) {
-          memories(bank).write(requestRow, io.request.bits.data)
-        }
-      }
-      responseRegister.data := io.request.bits.data
-      state := respond
-    }.otherwise {
-      state := waitForRead
-    }
+    pending := io.request.bits
   }
+  pendingValid := io.request.fire
 
-  when(state === waitForRead) {
-    val selectedData = Mux1H(
-      (0 until p.accumulatorBanks).map { bank =>
-        (requestRegister.address >> rowBits) === bank.U
-      },
-      readData
+  private val pendingBank = pending.address >> rowBits
+  private val pendingRow = pending.address(rowBits - 1, 0)
+  private val selectedData = Mux1H(
+    (0 until p.accumulatorBanks).map(bank => pendingBank === bank.U),
+    readData
+  )
+  private val result = Wire(rowType)
+
+  for (lane <- 0 until p.dim) {
+    val signedInput = Mux(
+      pending.negate,
+      -pending.data(lane),
+      pending.data(lane)
     )
-
-    when(requestRegister.operation === AccumulatorOperation.add) {
-      val sum = Wire(rowType)
-      for (lane <- 0 until p.dim) {
-        val signedInput = Mux(
-          requestRegister.negate,
-          -requestRegister.data(lane),
-          requestRegister.data(lane)
-        )
-        val shiftedWide = signedInput << requestRegister.shift
-        val shifted = shiftedWide(p.accumulatorBits - 1, 0).asSInt
-        sum(lane) := (selectedData(lane) + shifted)(p.accumulatorBits - 1, 0).asSInt
-      }
-
-      val storedBank = requestRegister.address >> rowBits
-      val storedRow = requestRegister.address(rowBits - 1, 0)
-      for (bank <- 0 until p.accumulatorBanks) {
-        when(storedBank === bank.U) {
-          memories(bank).write(storedRow, sum)
-        }
-      }
-      responseRegister.data := sum
-    }.otherwise {
-      responseRegister.data := selectedData
-    }
-    state := respond
+    val shiftedWide = signedInput << pending.shift
+    val shifted = shiftedWide(p.accumulatorBits - 1, 0).asSInt
+    val added =
+      (selectedData(lane) + shifted)(p.accumulatorBits - 1, 0).asSInt
+    result(lane) := Mux(
+      pending.operation === AccumulatorOperation.write,
+      pending.data(lane),
+      Mux(
+        pending.operation === AccumulatorOperation.add,
+        added,
+        selectedData(lane)
+      )
+    )
   }
 
-  when(io.response.fire) {
-    state := idle
+  responses.io.enq.valid := pendingValid
+  responses.io.enq.bits.data := result
+  responses.io.enq.bits.completesOutput := pending.completesOutput
+  responses.io.enq.bits.block := pending.block
+  responses.io.enq.bits.pixel := pending.pixel
+  responses.io.enq.bits.outputX := pending.outputX
+  responses.io.enq.bits.outputY := pending.outputY
+  when(pendingValid) {
+    assert(responses.io.enq.ready, "accumulator response skid overflow")
+  }
+
+  when(pendingValid && pendingWrites) {
+    for (bank <- 0 until p.accumulatorBanks) {
+      when(pendingBank === bank.U) {
+        memories(bank).write(pendingRow, result)
+      }
+    }
   }
 }

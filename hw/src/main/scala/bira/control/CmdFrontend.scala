@@ -13,25 +13,25 @@ import chisel3.util._
   * channel. A later LazyRoCC wrapper can connect RoCCCommand/RoCCResponse
   * without changing this module.
   */
-class BiRaCmdFrontend(p: BiRaParams) extends Module {
+class CmdFrontend(p: AccelParams) extends Module {
   val io = IO(new Bundle {
-    val command = Flipped(Decoupled(new BiRaRawCommand))
-    val response = Decoupled(new BiRaRawResponse)
+    val command = Flipped(Decoupled(new RawCmd))
+    val response = Decoupled(new RawResp)
 
-    val loadTask = Decoupled(new BiRaDmaTask(p))
-    val execTask = Decoupled(new BiRaExecTask(p))
-    val storeTask = Decoupled(new BiRaDmaTask(p))
-    val completion = Flipped(Decoupled(new BiRaTaskCompletion(p)))
+    val loadTask = Decoupled(new DmaTask(p))
+    val execTask = Decoupled(new ExecTask(p))
+    val storeTask = Decoupled(new DmaTask(p))
+    val completion = Flipped(Decoupled(new Completion(p)))
 
-    val schedulerStatus = Input(new BiRaSchedulerStatus)
-    val contexts = Output(Vec(p.nContexts, new BiRaContext(p)))
+    val schedulerStatus = Input(new SchedStatus)
+    val contexts = Output(Vec(p.nContexts, new Context(p)))
 
-    val tlbFlush = Decoupled(new BiRaTlbFlushRequest)
+    val tlbFlush = Decoupled(new FlushReq)
     val tlbFlushDone = Flipped(Valid(UInt(8.W)))
   })
 
   private val contexts =
-    RegInit(VecInit.fill(p.nContexts)(0.U.asTypeOf(new BiRaContext(p))))
+    RegInit(VecInit.fill(p.nContexts)(0.U.asTypeOf(new Context(p))))
   io.contexts := contexts
 
   private val nextCommandSequence = RegInit(0.U(16.W))
@@ -60,6 +60,33 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
   private val flushIssued = RegInit(false.B)
   private val flushRd = RegInit(0.U(5.W))
 
+  // CFG_COMMIT is deliberately multi-cycle. Capturing a Context, deriving its
+  // validation flags, classifying the result, and applying the update in
+  // separate cycles prevents a dynamically selected Context from feeding the
+  // arithmetic validation tree and another dynamically selected Context's
+  // write enable in one path.
+  private val commitIdle :: commitDerive :: commitClassify :: commitApply :: Nil =
+    Enum(4)
+  private val commitState = RegInit(commitIdle)
+  private val commitContext = Reg(new Context(p))
+  private val commitContextId = Reg(UInt(p.contextIdBits.W))
+  private val commitContextIndex = Reg(UInt(p.contextIndexBits.W))
+  private val commitContextImplemented = RegInit(false.B)
+  private val commitEncodingValid = RegInit(false.B)
+  private val commitSequence = Reg(UInt(16.W))
+
+  private val commitContextStateInvalid = RegInit(false.B)
+  private val commitConfigStateInvalid = RegInit(false.B)
+  private val commitBadShape = RegInit(false.B)
+  private val commitMissingAddress = RegInit(false.B)
+  private val commitIllegalCombination = RegInit(false.B)
+  private val commitHasExistingError = RegInit(false.B)
+
+  private val commitNoAction :: commitGlobalError :: commitContextError :: commitContextReady :: Nil =
+    Enum(4)
+  private val commitAction = RegInit(commitNoAction)
+  private val commitErrorCode = RegInit(ErrorCode.none.U(8.W))
+
   private val contextId = io.command.bits.rs1(p.contextIdBits - 1, 0)
   private val contextIndex =
     contextId(p.contextIndexBits - 1, 0)
@@ -83,7 +110,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
     ctx: UInt,
     sequence: UInt
   ): Unit = {
-    when(globalErrorCode === BiRaError.none.U) {
+    when(globalErrorCode === ErrorCode.none.U) {
       globalErrorCode := code
       globalErrorContext := ctx
       globalErrorSequence := sequence
@@ -97,22 +124,22 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
   ): Unit = {
     val index = ctx(p.contextIndexBits - 1, 0)
     when(ctx < p.nContexts.U) {
-      when(contexts(index).errorCode === BiRaError.none.U) {
+      when(contexts(index).errorCode === ErrorCode.none.U) {
         contexts(index).errorCode := code
         contexts(index).errorCommandSequence := sequence
       }
       recordGlobalError(code, ctx, sequence)
     }.otherwise {
       recordGlobalError(
-        BiRaError.invalidContext.U,
+        ErrorCode.invalidContext.U,
         ctx,
         sequence
       )
     }
   }
 
-  private def dmaTaskBits: BiRaDmaTask = {
-    val task = Wire(new BiRaDmaTask(p))
+  private def dmaTaskBits: DmaTask = {
+    val task = Wire(new DmaTask(p))
     task.contextId := dmaContextId
     task.role := dmaRole
     task.dramVirtualAddress := io.command.bits.rs1
@@ -144,7 +171,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
   }
 
   private val frontendBlocked =
-    responseValid || fencePending || flushPending
+    responseValid || fencePending || flushPending || commitState =/= commitIdle
   io.command.ready := false.B
 
   private val acceptedDynamicTask = WireInit(false.B)
@@ -152,27 +179,27 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
     WireInit(0.U(p.contextIdBits.W))
 
   private val commandFunct = io.command.bits.funct
-  private val isLoad = commandFunct === BiRaFunct.load2d.U
-  private val isExec = commandFunct === BiRaFunct.execConv.U
-  private val isStore = commandFunct === BiRaFunct.store2d.U
+  private val isLoad = commandFunct === Funct.load2d.U
+  private val isExec = commandFunct === Funct.execConv.U
+  private val isStore = commandFunct === Funct.store2d.U
   private val knownFunct = Seq(
-    BiRaFunct.cfgShape,
-    BiRaFunct.cfgAddr,
-    BiRaFunct.cfgMode,
-    BiRaFunct.cfgCommit,
-    BiRaFunct.load2d,
-    BiRaFunct.execConv,
-    BiRaFunct.store2d,
-    BiRaFunct.fence,
-    BiRaFunct.status,
-    BiRaFunct.tlbFlush
+    Funct.cfgShape,
+    Funct.cfgAddr,
+    Funct.cfgMode,
+    Funct.cfgCommit,
+    Funct.load2d,
+    Funct.execConv,
+    Funct.store2d,
+    Funct.fence,
+    Funct.status,
+    Funct.tlbFlush
   ).map(value => commandFunct === value.U).reduce(_ || _)
 
   private val dmaContextUsable =
     dmaContextImplemented &&
       dmaSelectedContext.ready &&
       dmaSelectedContext.committed &&
-      dmaSelectedContext.errorCode === BiRaError.none.U
+      dmaSelectedContext.errorCode === ErrorCode.none.U
   private val dmaDescriptorValid =
     io.command.bits.rs2(34, 21) =/= 0.U &&
       io.command.bits.rs2(41, 35) =/= 0.U &&
@@ -180,7 +207,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         io.command.bits.rs2(41, 35) &&
       io.command.bits.rs2(63, 58) =/= 0.U
   private val dmaRoleConfigured =
-    dmaRole < BiRaAddrRole.count.U &&
+    dmaRole < AddrRole.count.U &&
       dmaSelectedContext.addressValid(dmaRole)
   private val dmaTaskUsable =
     dmaContextUsable &&
@@ -199,7 +226,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
     contextImplemented &&
       selectedContext.ready &&
       selectedContext.committed &&
-      selectedContext.errorCode === BiRaError.none.U &&
+      selectedContext.errorCode === ErrorCode.none.U &&
       execEncodingValid
 
   when(!frontendBlocked) {
@@ -207,7 +234,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
     // pipeline; the error is reported through STATUS/FENCE below.
     io.command.ready := true.B
     switch(commandFunct) {
-      is(BiRaFunct.load2d.U) {
+      is(Funct.load2d.U) {
         when(dmaTaskUsable) {
           io.loadTask.valid := io.command.valid
           io.command.ready := io.loadTask.ready
@@ -216,7 +243,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         }
       }
 
-      is(BiRaFunct.execConv.U) {
+      is(Funct.execConv.U) {
         when(execContextUsable) {
           io.execTask.valid := io.command.valid
           io.command.ready := io.execTask.ready
@@ -225,7 +252,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         }
       }
 
-      is(BiRaFunct.store2d.U) {
+      is(Funct.store2d.U) {
         when(dmaTaskUsable) {
           io.storeTask.valid := io.command.valid
           io.command.ready := io.storeTask.ready
@@ -234,13 +261,13 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         }
       }
 
-      is(BiRaFunct.cfgShape.U) { io.command.ready := true.B }
-      is(BiRaFunct.cfgAddr.U) { io.command.ready := true.B }
-      is(BiRaFunct.cfgMode.U) { io.command.ready := true.B }
-      is(BiRaFunct.cfgCommit.U) { io.command.ready := true.B }
-      is(BiRaFunct.fence.U) { io.command.ready := true.B }
-      is(BiRaFunct.status.U) { io.command.ready := true.B }
-      is(BiRaFunct.tlbFlush.U) { io.command.ready := true.B }
+      is(Funct.cfgShape.U) { io.command.ready := true.B }
+      is(Funct.cfgAddr.U) { io.command.ready := true.B }
+      is(Funct.cfgMode.U) { io.command.ready := true.B }
+      is(Funct.cfgCommit.U) { io.command.ready := true.B }
+      is(Funct.fence.U) { io.command.ready := true.B }
+      is(Funct.status.U) { io.command.ready := true.B }
+      is(Funct.tlbFlush.U) { io.command.ready := true.B }
     }
   }
 
@@ -283,7 +310,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
       io.completion.bits.contextId(p.contextIndexBits - 1, 0)
     when(io.completion.bits.contextId < p.nContexts.U) {
       when(
-        io.completion.bits.errorCode =/= BiRaError.none.U
+        io.completion.bits.errorCode =/= ErrorCode.none.U
       ) {
         recordContextError(
           io.completion.bits.contextId,
@@ -297,14 +324,14 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
       )
     }.otherwise {
       recordGlobalError(
-        BiRaError.invalidContext.U,
+        ErrorCode.invalidContext.U,
         io.completion.bits.contextId,
         io.completion.bits.commandSequence
       )
     }
   }
 
-  private def configurationEncodingIsValid(
+  private def cfgEncodingValid(
     reservedIsZero: Bool
   ): Bool = {
     io.command.bits.xs1 &&
@@ -315,32 +342,32 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
 
   when(io.command.fire) {
     switch(commandFunct) {
-      is(BiRaFunct.cfgShape.U) {
-        val encodingValid = configurationEncodingIsValid(
+      is(Funct.cfgShape.U) {
+        val encodingValid = cfgEncodingValid(
           io.command.bits.rs1(63, 51) === 0.U &&
             io.command.bits.rs2(63, 40) === 0.U
         )
         when(!contextImplemented) {
           recordGlobalError(
-            BiRaError.invalidContext.U,
+            ErrorCode.invalidContext.U,
             contextId,
             nextCommandSequence
           )
         }.elsewhen(!encodingValid) {
           recordContextError(
             contextId,
-            BiRaError.badEnum.U,
+            ErrorCode.badEnum.U,
             nextCommandSequence
           )
         }.elsewhen(selectedContext.inflightCount =/= 0.U) {
           recordContextError(
             contextId,
-            BiRaError.contextBusy.U,
+            ErrorCode.contextBusy.U,
             nextCommandSequence
           )
         }.otherwise {
           contexts(contextIndex) :=
-            0.U.asTypeOf(new BiRaContext(p))
+            0.U.asTypeOf(new Context(p))
           contexts(contextIndex).building := true.B
           contexts(contextIndex).shapeValid := true.B
           contexts(contextIndex).inputHeight :=
@@ -366,22 +393,22 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         }
       }
 
-      is(BiRaFunct.cfgAddr.U) {
+      is(Funct.cfgAddr.U) {
         val role = io.command.bits.rs1(6, 3)
-        val encodingValid = configurationEncodingIsValid(
+        val encodingValid = cfgEncodingValid(
           io.command.bits.rs1(63, 23) === 0.U &&
             io.command.bits.rs2 === 0.U
         )
         when(!contextImplemented) {
           recordGlobalError(
-            BiRaError.invalidContext.U,
+            ErrorCode.invalidContext.U,
             contextId,
             nextCommandSequence
           )
         }.elsewhen(!encodingValid) {
           recordContextError(
             contextId,
-            BiRaError.badEnum.U,
+            ErrorCode.badEnum.U,
             nextCommandSequence
           )
         }.elsewhen(
@@ -390,13 +417,13 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         ) {
           recordContextError(
             contextId,
-            BiRaError.contextState.U,
+            ErrorCode.contextState.U,
             nextCommandSequence
           )
-        }.elsewhen(role >= BiRaAddrRole.count.U) {
+        }.elsewhen(role >= AddrRole.count.U) {
           recordContextError(
             contextId,
-            BiRaError.badRole.U,
+            ErrorCode.badRole.U,
             nextCommandSequence
           )
         }.otherwise {
@@ -407,22 +434,22 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         }
       }
 
-      is(BiRaFunct.cfgMode.U) {
+      is(Funct.cfgMode.U) {
         val postMode = io.command.bits.rs1(10, 8)
-        val encodingValid = configurationEncodingIsValid(
+        val encodingValid = cfgEncodingValid(
           io.command.bits.rs1(63, 14) === 0.U &&
             io.command.bits.rs2 === 0.U
         )
         when(!contextImplemented) {
           recordGlobalError(
-            BiRaError.invalidContext.U,
+            ErrorCode.invalidContext.U,
             contextId,
             nextCommandSequence
           )
         }.elsewhen(!encodingValid) {
           recordContextError(
             contextId,
-            BiRaError.badEnum.U,
+            ErrorCode.badEnum.U,
             nextCommandSequence
           )
         }.elsewhen(
@@ -431,13 +458,13 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         ) {
           recordContextError(
             contextId,
-            BiRaError.contextState.U,
+            ErrorCode.contextState.U,
             nextCommandSequence
           )
-        }.elsewhen(postMode > BiRaPostMode.finalBilinearResidual.U) {
+        }.elsewhen(postMode > PostMode.finalBilinearResidual.U) {
           recordContextError(
             contextId,
-            BiRaError.badEnum.U,
+            ErrorCode.badEnum.U,
             nextCommandSequence
           )
         }.otherwise {
@@ -458,204 +485,21 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         }
       }
 
-      is(BiRaFunct.cfgCommit.U) {
-        val encodingValid = configurationEncodingIsValid(
+      is(Funct.cfgCommit.U) {
+        val encodingValid = cfgEncodingValid(
           io.command.bits.rs1(63, p.contextIdBits) === 0.U &&
             io.command.bits.rs2 === 0.U
         )
-        when(!contextImplemented) {
-          recordGlobalError(
-            BiRaError.invalidContext.U,
-            contextId,
-            nextCommandSequence
-          )
-        }.elsewhen(!encodingValid) {
-          recordContextError(
-            contextId,
-            BiRaError.badEnum.U,
-            nextCommandSequence
-          )
-        }.elsewhen(
-          !selectedContext.building ||
-            selectedContext.inflightCount =/= 0.U
-        ) {
-          recordContextError(
-            contextId,
-            BiRaError.contextState.U,
-            nextCommandSequence
-          )
-        }.otherwise {
-          val inputExtentHeight =
-            selectedContext.inputHeight +
-              (selectedContext.paddingHeight << 1)
-          val inputExtentWidth =
-            selectedContext.inputWidth +
-              (selectedContext.paddingWidth << 1)
-          val expectedOutputHeight =
-            inputExtentHeight - selectedContext.kernelHeight + 1.U
-          val expectedOutputWidth =
-            inputExtentWidth - selectedContext.kernelWidth + 1.U
-
-          val shapeNonZero =
-            selectedContext.inputHeight =/= 0.U &&
-              selectedContext.inputWidth =/= 0.U &&
-              selectedContext.inputChannels =/= 0.U &&
-              selectedContext.outputHeight =/= 0.U &&
-              selectedContext.outputWidth =/= 0.U &&
-              selectedContext.outputChannels =/= 0.U &&
-              selectedContext.kernelHeight =/= 0.U &&
-              selectedContext.kernelWidth =/= 0.U
-          val shapeWithinLimits =
-            selectedContext.inputHeight <= p.maxImageHeight.U &&
-              selectedContext.inputWidth <= p.maxImageWidth.U &&
-              selectedContext.outputHeight <= p.maxImageHeight.U &&
-              selectedContext.outputWidth <= p.maxImageWidth.U &&
-              selectedContext.inputChannels <= p.maxInputChannels.U &&
-              selectedContext.outputChannels <=
-                (p.maxOutputBlocks * p.dim).U &&
-              selectedContext.kernelHeight <= p.kernelSize.U &&
-              selectedContext.kernelWidth <= p.kernelSize.U
-          val convolutionShapeMatches =
-            inputExtentHeight >= selectedContext.kernelHeight &&
-              inputExtentWidth >= selectedContext.kernelWidth &&
-              selectedContext.outputHeight === expectedOutputHeight &&
-              selectedContext.outputWidth === expectedOutputWidth
-
-          val addressValid = selectedContext.addressValid
-          val hasInput = addressValid(BiRaAddrRole.input)
-          val hasWeightLow = addressValid(BiRaAddrRole.weightLow)
-          val hasWeightHigh = addressValid(BiRaAddrRole.weightHigh)
-          val hasParameter = addressValid(BiRaAddrRole.parameter)
-          val hasResidual = addressValid(BiRaAddrRole.residual)
-          val hasCorrection = addressValid(BiRaAddrRole.correction)
-          val hasAccumulator = addressValid(BiRaAddrRole.accumulator)
-          val hasOutputFull = addressValid(BiRaAddrRole.outputFull)
-          val hasOutputBinary =
-            addressValid(BiRaAddrRole.outputBinary)
-
-          val binaryMode =
-            selectedContext.arrayMode === BiRaArrayMode.binary.U
-          val columnReduce =
-            selectedContext.arrayMode === BiRaArrayMode.columnReduce.U
-          val depthwise =
-            selectedContext.arrayMode === BiRaArrayMode.depthwise.U
-          val requiresWeightHigh =
-            !binaryMode &&
-              selectedContext.weightPrecision ===
-                BiRaWeightPrecision.w16.U
-          val requiresResidual =
-            selectedContext.postMode === BiRaPostMode.binaryFused.U ||
-              selectedContext.postMode ===
-                BiRaPostMode.finalBilinearResidual.U
-          val requiresParameter =
-            !binaryMode ||
-              selectedContext.postMode =/= BiRaPostMode.none.U
-
-          val requiredAddressesPresent =
-            hasInput &&
-              hasWeightLow &&
-              hasAccumulator &&
-              Mux(requiresParameter, hasParameter, true.B) &&
-              Mux(requiresWeightHigh, hasWeightHigh, true.B) &&
-              Mux(binaryMode, hasCorrection, true.B) &&
-              Mux(requiresResidual, hasResidual, true.B) &&
-              Mux(selectedContext.writeFull, hasOutputFull, true.B) &&
-              Mux(
-                selectedContext.writeBinary,
-                hasOutputBinary,
-                true.B
-              )
-
-          val outputSelectionValid =
-            selectedContext.writeFull ||
-              selectedContext.writeBinary ||
-              selectedContext.postMode === BiRaPostMode.none.U
-          val depthwiseValid =
-            !depthwise ||
-              selectedContext.inputChannels ===
-                selectedContext.outputChannels
-          val binaryValid =
-            !binaryMode ||
-              (selectedContext.inputChannels % p.dim.U === 0.U)
-          val columnReduceValid =
-            !columnReduce ||
-              (selectedContext.inputChannels <= (p.dim / 2).U &&
-                selectedContext.outputChannels === 1.U)
-          val shuffleOutputChannels =
-            (p.dim / 2) * p.maxShuffleScale * p.maxShuffleScale
-          val shuffleValid =
-            !selectedContext.shufflePack2 ||
-              (selectedContext.arrayMode === BiRaArrayMode.dense.U &&
-                selectedContext.postMode === BiRaPostMode.intPrelu.U &&
-                selectedContext.outputChannels ===
-                  shuffleOutputChannels.U &&
-                selectedContext.writeFull &&
-                !selectedContext.writeBinary)
-          val binaryPostValid =
-            selectedContext.postMode =/= BiRaPostMode.binaryFused.U ||
-              binaryMode
-          val finalPostValid =
-            selectedContext.postMode =/=
-              BiRaPostMode.finalBilinearResidual.U ||
-              (columnReduce &&
-                selectedContext.outputChannels === 1.U &&
-                selectedContext.outputHeight %
-                  p.maxShuffleScale.U === 0.U &&
-                selectedContext.outputWidth %
-                  p.maxShuffleScale.U === 0.U)
-
-          when(
-            !selectedContext.shapeValid ||
-              !selectedContext.modeValid
-          ) {
-            recordContextError(
-              contextId,
-              BiRaError.contextState.U,
-              nextCommandSequence
-            )
-          }.elsewhen(
-            !shapeNonZero ||
-              !shapeWithinLimits ||
-              !convolutionShapeMatches
-          ) {
-            recordContextError(
-              contextId,
-              BiRaError.badShape.U,
-              nextCommandSequence
-            )
-          }.elsewhen(!requiredAddressesPresent) {
-            recordContextError(
-              contextId,
-              BiRaError.missingAddress.U,
-              nextCommandSequence
-            )
-          }.elsewhen(
-            !outputSelectionValid ||
-              !depthwiseValid ||
-              !binaryValid ||
-              !columnReduceValid ||
-              !shuffleValid ||
-              !binaryPostValid ||
-              !finalPostValid
-          ) {
-            recordContextError(
-              contextId,
-              BiRaError.illegalCombination.U,
-              nextCommandSequence
-            )
-          }.elsewhen(
-            selectedContext.errorCode =/= BiRaError.none.U
-          ) {
-            // Preserve the first configuration error.
-          }.otherwise {
-            contexts(contextIndex).building := false.B
-            contexts(contextIndex).ready := true.B
-            contexts(contextIndex).committed := true.B
-          }
-        }
+        commitContext := selectedContext
+        commitContextId := contextId
+        commitContextIndex := contextIndex
+        commitContextImplemented := contextImplemented
+        commitEncodingValid := encodingValid
+        commitSequence := nextCommandSequence
+        commitState := commitDerive
       }
 
-      is(BiRaFunct.load2d.U) {
+      is(Funct.load2d.U) {
         when(
           io.command.bits.xd ||
             !io.command.bits.xs1 ||
@@ -663,43 +507,43 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         ) {
           recordContextError(
             dmaContextId,
-            BiRaError.badEnum.U,
+            ErrorCode.badEnum.U,
             nextCommandSequence
           )
           when(io.command.bits.xd) {
             responseValid := true.B
             responseRd := io.command.bits.rd
-            responseData := BiRaError.badEnum.U
+            responseData := ErrorCode.badEnum.U
           }
         }.elsewhen(!dmaContextImplemented) {
           recordGlobalError(
-            BiRaError.invalidContext.U,
+            ErrorCode.invalidContext.U,
             dmaContextId,
             nextCommandSequence
           )
-        }.elsewhen(dmaRole >= BiRaAddrRole.count.U) {
+        }.elsewhen(dmaRole >= AddrRole.count.U) {
           recordContextError(
             dmaContextId,
-            BiRaError.badRole.U,
+            ErrorCode.badRole.U,
             nextCommandSequence
           )
         }.elsewhen(!dmaSelectedContext.addressValid(dmaRole)) {
           recordContextError(
             dmaContextId,
-            BiRaError.missingAddress.U,
+            ErrorCode.missingAddress.U,
             nextCommandSequence
           )
         }.elsewhen(!dmaSelectedContext.ready) {
           recordContextError(
             dmaContextId,
-            BiRaError.contextNotReady.U,
+            ErrorCode.contextNotReady.U,
             nextCommandSequence
           )
         }.elsewhen(
-          dmaSelectedContext.errorCode =/= BiRaError.none.U
+          dmaSelectedContext.errorCode =/= ErrorCode.none.U
         ) {
           recordGlobalError(
-            BiRaError.contextFailed.U,
+            ErrorCode.contextFailed.U,
             dmaContextId,
             nextCommandSequence
           )
@@ -709,7 +553,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         ) {
           recordContextError(
             dmaContextId,
-            BiRaError.zeroSize.U,
+            ErrorCode.zeroSize.U,
             nextCommandSequence
           )
         }.elsewhen(
@@ -719,48 +563,48 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         ) {
           recordContextError(
             dmaContextId,
-            BiRaError.badStride.U,
+            ErrorCode.badStride.U,
             nextCommandSequence
           )
         }
       }
 
-      is(BiRaFunct.execConv.U) {
+      is(Funct.execConv.U) {
         when(!execEncodingValid) {
           recordContextError(
             contextId,
-            BiRaError.badEnum.U,
+            ErrorCode.badEnum.U,
             nextCommandSequence
           )
           when(io.command.bits.xd) {
             responseValid := true.B
             responseRd := io.command.bits.rd
-            responseData := BiRaError.badEnum.U
+            responseData := ErrorCode.badEnum.U
           }
         }.elsewhen(!contextImplemented) {
           recordGlobalError(
-            BiRaError.invalidContext.U,
+            ErrorCode.invalidContext.U,
             contextId,
             nextCommandSequence
           )
         }.elsewhen(!selectedContext.ready) {
           recordContextError(
             contextId,
-            BiRaError.contextNotReady.U,
+            ErrorCode.contextNotReady.U,
             nextCommandSequence
           )
         }.elsewhen(
-          selectedContext.errorCode =/= BiRaError.none.U
+          selectedContext.errorCode =/= ErrorCode.none.U
         ) {
           recordGlobalError(
-            BiRaError.contextFailed.U,
+            ErrorCode.contextFailed.U,
             contextId,
             nextCommandSequence
           )
         }
       }
 
-      is(BiRaFunct.store2d.U) {
+      is(Funct.store2d.U) {
         when(
           io.command.bits.xd ||
             !io.command.bits.xs1 ||
@@ -768,43 +612,43 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         ) {
           recordContextError(
             dmaContextId,
-            BiRaError.badEnum.U,
+            ErrorCode.badEnum.U,
             nextCommandSequence
           )
           when(io.command.bits.xd) {
             responseValid := true.B
             responseRd := io.command.bits.rd
-            responseData := BiRaError.badEnum.U
+            responseData := ErrorCode.badEnum.U
           }
         }.elsewhen(!dmaContextImplemented) {
           recordGlobalError(
-            BiRaError.invalidContext.U,
+            ErrorCode.invalidContext.U,
             dmaContextId,
             nextCommandSequence
           )
-        }.elsewhen(dmaRole >= BiRaAddrRole.count.U) {
+        }.elsewhen(dmaRole >= AddrRole.count.U) {
           recordContextError(
             dmaContextId,
-            BiRaError.badRole.U,
+            ErrorCode.badRole.U,
             nextCommandSequence
           )
         }.elsewhen(!dmaSelectedContext.addressValid(dmaRole)) {
           recordContextError(
             dmaContextId,
-            BiRaError.missingAddress.U,
+            ErrorCode.missingAddress.U,
             nextCommandSequence
           )
         }.elsewhen(!dmaSelectedContext.ready) {
           recordContextError(
             dmaContextId,
-            BiRaError.contextNotReady.U,
+            ErrorCode.contextNotReady.U,
             nextCommandSequence
           )
         }.elsewhen(
-          dmaSelectedContext.errorCode =/= BiRaError.none.U
+          dmaSelectedContext.errorCode =/= ErrorCode.none.U
         ) {
           recordGlobalError(
-            BiRaError.contextFailed.U,
+            ErrorCode.contextFailed.U,
             dmaContextId,
             nextCommandSequence
           )
@@ -814,7 +658,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         ) {
           recordContextError(
             dmaContextId,
-            BiRaError.zeroSize.U,
+            ErrorCode.zeroSize.U,
             nextCommandSequence
           )
         }.elsewhen(
@@ -824,13 +668,13 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         ) {
           recordContextError(
             dmaContextId,
-            BiRaError.badStride.U,
+            ErrorCode.badStride.U,
             nextCommandSequence
           )
         }
       }
 
-      is(BiRaFunct.fence.U) {
+      is(Funct.fence.U) {
         val encodingValid =
           io.command.bits.xd &&
             io.command.bits.xs1 &&
@@ -841,7 +685,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
           responseValid := true.B
           responseRd := io.command.bits.rd
           responseData :=
-            (BiRaError.badEnum.U(8.W) << 1)
+            (ErrorCode.badEnum.U(8.W) << 1)
         }.otherwise {
           fencePending := true.B
           fenceContextScope := io.command.bits.rs1(0)
@@ -851,7 +695,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         }
       }
 
-      is(BiRaFunct.status.U) {
+      is(Funct.status.U) {
         val statusContextScope = io.command.bits.rs1(0)
         val statusContextId =
           io.command.bits.rs1(p.contextIdBits, 1)
@@ -871,14 +715,14 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
 
         when(!encodingValid) {
           responseData :=
-            (BiRaError.badEnum.U(8.W) << 13) | (1.U << 12)
+            (ErrorCode.badEnum.U(8.W) << 13) | (1.U << 12)
         }.elsewhen(statusContextScope) {
           when(statusContextId < p.nContexts.U) {
             val ctx = contexts(statusContextIndex)
             val clearBlocked = clearError && ctx.inflightCount =/= 0.U
             val reportedError = Mux(
               clearBlocked,
-              BiRaError.contextBusy.U,
+              ErrorCode.contextBusy.U,
               ctx.errorCode
             )
             responseData :=
@@ -887,24 +731,24 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
                 (ctx.ready.asUInt << 2) |
                 (ctx.committed.asUInt << 3) |
                 (ctx.inflightCount << 4) |
-                ((reportedError =/= BiRaError.none.U).asUInt << 12) |
+                ((reportedError =/= ErrorCode.none.U).asUInt << 12) |
                 (reportedError << 13) |
                 (ctx.errorCommandSequence << 21)
             when(clearError && !clearBlocked) {
               contexts(statusContextIndex).errorCode :=
-                BiRaError.none.U
+                ErrorCode.none.U
               contexts(statusContextIndex).errorCommandSequence := 0.U
             }
           }.otherwise {
             responseData :=
-              (BiRaError.invalidContext.U(8.W) << 13) |
+              (ErrorCode.invalidContext.U(8.W) << 13) |
                 (1.U << 12)
           }
         }.otherwise {
           val clearBlocked = clearError && anyInflight
           val reportedError = Mux(
             clearBlocked,
-            BiRaError.contextBusy.U,
+            ErrorCode.contextBusy.U,
             globalErrorCode
           )
           responseData :=
@@ -914,25 +758,25 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
               (io.schedulerStatus.loadBusy.asUInt << 3) |
               (io.schedulerStatus.execBusy.asUInt << 4) |
               (io.schedulerStatus.storeBusy.asUInt << 5) |
-              ((reportedError =/= BiRaError.none.U).asUInt << 6) |
+              ((reportedError =/= ErrorCode.none.U).asUInt << 6) |
               (reportedError << 7) |
               (globalErrorContext << 15) |
               (io.schedulerStatus.loadQueueCount << 18) |
               (io.schedulerStatus.execQueueCount << 26) |
               (io.schedulerStatus.storeQueueCount << 34)
           when(clearError && !clearBlocked) {
-            globalErrorCode := BiRaError.none.U
+            globalErrorCode := ErrorCode.none.U
             globalErrorContext := 0.U
             globalErrorSequence := 0.U
             for (i <- 0 until p.nContexts) {
-              contexts(i).errorCode := BiRaError.none.U
+              contexts(i).errorCode := ErrorCode.none.U
               contexts(i).errorCommandSequence := 0.U
             }
           }
         }
       }
 
-      is(BiRaFunct.tlbFlush.U) {
+      is(Funct.tlbFlush.U) {
         val encodingValid =
           io.command.bits.xd &&
             io.command.bits.xs1 &&
@@ -942,7 +786,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
         when(!encodingValid) {
           responseValid := true.B
           responseRd := io.command.bits.rd
-          responseData := BiRaError.badEnum.U
+          responseData := ErrorCode.badEnum.U
         }.otherwise {
           flushPending := true.B
           flushIssued := false.B
@@ -953,16 +797,178 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
     }
   }
 
+  switch(commitState) {
+    is(commitDerive) {
+      val inputExtentHeight =
+        commitContext.inputHeight + (commitContext.paddingHeight << 1)
+      val inputExtentWidth =
+        commitContext.inputWidth + (commitContext.paddingWidth << 1)
+      val expectedOutputHeight =
+        inputExtentHeight - commitContext.kernelHeight + 1.U
+      val expectedOutputWidth =
+        inputExtentWidth - commitContext.kernelWidth + 1.U
+
+      val shapeNonZero =
+        commitContext.inputHeight =/= 0.U &&
+          commitContext.inputWidth =/= 0.U &&
+          commitContext.inputChannels =/= 0.U &&
+          commitContext.outputHeight =/= 0.U &&
+          commitContext.outputWidth =/= 0.U &&
+          commitContext.outputChannels =/= 0.U &&
+          commitContext.kernelHeight =/= 0.U &&
+          commitContext.kernelWidth =/= 0.U
+      val shapeWithinLimits =
+        commitContext.inputHeight <= p.maxImageHeight.U &&
+          commitContext.inputWidth <= p.maxImageWidth.U &&
+          commitContext.outputHeight <= p.maxImageHeight.U &&
+          commitContext.outputWidth <= p.maxImageWidth.U &&
+          commitContext.inputChannels <= p.maxInputChannels.U &&
+          commitContext.outputChannels <= (p.maxOutputBlocks * p.dim).U &&
+          commitContext.kernelHeight <= p.kernelSize.U &&
+          commitContext.kernelWidth <= p.kernelSize.U
+      val convolutionShapeMatches =
+        inputExtentHeight >= commitContext.kernelHeight &&
+          inputExtentWidth >= commitContext.kernelWidth &&
+          commitContext.outputHeight === expectedOutputHeight &&
+          commitContext.outputWidth === expectedOutputWidth
+
+      val addressValid = commitContext.addressValid
+      val binaryMode = commitContext.arrayMode === ArrayMode.binary.U
+      val columnReduce =
+        commitContext.arrayMode === ArrayMode.columnReduce.U
+      val depthwise = commitContext.arrayMode === ArrayMode.depthwise.U
+      val requiresWeightHigh =
+        !binaryMode && commitContext.weightPrecision === WgtPrecision.w16.U
+      val requiresResidual =
+        commitContext.postMode === PostMode.binaryFused.U ||
+          commitContext.postMode === PostMode.finalBilinearResidual.U
+      val requiresParameter =
+        !binaryMode || commitContext.postMode =/= PostMode.none.U
+      val requiredAddressesPresent =
+        addressValid(AddrRole.input) &&
+          addressValid(AddrRole.weightLow) &&
+          addressValid(AddrRole.accumulator) &&
+          Mux(requiresParameter, addressValid(AddrRole.parameter), true.B) &&
+          Mux(requiresWeightHigh, addressValid(AddrRole.weightHigh), true.B) &&
+          Mux(binaryMode, addressValid(AddrRole.correction), true.B) &&
+          Mux(requiresResidual, addressValid(AddrRole.residual), true.B) &&
+          Mux(commitContext.writeFull, addressValid(AddrRole.outputFull), true.B) &&
+          Mux(
+            commitContext.writeBinary,
+            addressValid(AddrRole.outputBinary),
+            true.B
+          )
+
+      val outputSelectionValid =
+        commitContext.writeFull ||
+          commitContext.writeBinary ||
+          commitContext.postMode === PostMode.none.U
+      val depthwiseValid =
+        !depthwise ||
+          commitContext.inputChannels === commitContext.outputChannels
+      val binaryValid =
+        !binaryMode || (commitContext.inputChannels % p.dim.U === 0.U)
+      val columnReduceValid =
+        !columnReduce ||
+          (commitContext.inputChannels <= (p.dim / 2).U &&
+            commitContext.outputChannels === 1.U)
+      val shuffleOutputChannels =
+        (p.dim / 2) * p.maxShuffleScale * p.maxShuffleScale
+      val shuffleValid =
+        !commitContext.shufflePack2 ||
+          (commitContext.arrayMode === ArrayMode.dense.U &&
+            commitContext.postMode === PostMode.intPrelu.U &&
+            commitContext.outputChannels === shuffleOutputChannels.U &&
+            commitContext.writeFull &&
+            !commitContext.writeBinary)
+      val binaryPostValid =
+        commitContext.postMode =/= PostMode.binaryFused.U || binaryMode
+      val finalPostValid =
+        commitContext.postMode =/= PostMode.finalBilinearResidual.U ||
+          (columnReduce &&
+            commitContext.outputChannels === 1.U &&
+            commitContext.outputHeight % p.maxShuffleScale.U === 0.U &&
+            commitContext.outputWidth % p.maxShuffleScale.U === 0.U)
+
+      commitContextStateInvalid :=
+        !commitContext.building || commitContext.inflightCount =/= 0.U
+      commitConfigStateInvalid :=
+        !commitContext.shapeValid || !commitContext.modeValid
+      commitBadShape :=
+        !shapeNonZero || !shapeWithinLimits || !convolutionShapeMatches
+      commitMissingAddress := !requiredAddressesPresent
+      commitIllegalCombination :=
+        !outputSelectionValid ||
+          !depthwiseValid ||
+          !binaryValid ||
+          !columnReduceValid ||
+          !shuffleValid ||
+          !binaryPostValid ||
+          !finalPostValid
+      commitHasExistingError :=
+        commitContext.errorCode =/= ErrorCode.none.U
+      commitState := commitClassify
+    }
+
+    is(commitClassify) {
+      commitAction := commitNoAction
+      commitErrorCode := ErrorCode.none.U
+      when(!commitContextImplemented) {
+        commitAction := commitGlobalError
+        commitErrorCode := ErrorCode.invalidContext.U
+      }.elsewhen(!commitEncodingValid) {
+        commitAction := commitContextError
+        commitErrorCode := ErrorCode.badEnum.U
+      }.elsewhen(commitContextStateInvalid || commitConfigStateInvalid) {
+        commitAction := commitContextError
+        commitErrorCode := ErrorCode.contextState.U
+      }.elsewhen(commitBadShape) {
+        commitAction := commitContextError
+        commitErrorCode := ErrorCode.badShape.U
+      }.elsewhen(commitMissingAddress) {
+        commitAction := commitContextError
+        commitErrorCode := ErrorCode.missingAddress.U
+      }.elsewhen(commitIllegalCombination) {
+        commitAction := commitContextError
+        commitErrorCode := ErrorCode.illegalCombination.U
+      }.elsewhen(!commitHasExistingError) {
+        commitAction := commitContextReady
+      }
+      commitState := commitApply
+    }
+
+    is(commitApply) {
+      when(commitAction === commitGlobalError) {
+        recordGlobalError(
+          commitErrorCode,
+          commitContextId,
+          commitSequence
+        )
+      }.elsewhen(commitAction === commitContextError) {
+        recordContextError(
+          commitContextId,
+          commitErrorCode,
+          commitSequence
+        )
+      }.elsewhen(commitAction === commitContextReady) {
+        contexts(commitContextIndex).building := false.B
+        contexts(commitContextIndex).ready := true.B
+        contexts(commitContextIndex).committed := true.B
+      }
+      commitState := commitIdle
+    }
+  }
+
   when(io.command.fire && !knownFunct) {
     recordGlobalError(
-      BiRaError.badEnum.U,
+      ErrorCode.badEnum.U,
       0.U,
       nextCommandSequence
     )
     when(io.command.bits.xd) {
       responseValid := true.B
       responseRd := io.command.bits.rd
-      responseData := BiRaError.badEnum.U
+      responseData := ErrorCode.badEnum.U
     }
   }
 
@@ -980,7 +986,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
     val contextErrorCode = Mux(
       fenceContextImplemented,
       contexts(fenceContextIndex).errorCode,
-      BiRaError.invalidContext.U
+      ErrorCode.invalidContext.U
     )
     val contextErrorSequence = Mux(
       fenceContextImplemented,
@@ -1005,7 +1011,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
     responseValid := true.B
     responseRd := fenceRd
     responseData :=
-      (errorCode === BiRaError.none.U).asUInt |
+      (errorCode === ErrorCode.none.U).asUInt |
         (errorCode << 1) |
         (errorContext << 9) |
         (errorSequence << 12)
@@ -1022,7 +1028,7 @@ class BiRaCmdFrontend(p: BiRaParams) extends Module {
     responseData := io.tlbFlushDone.bits
     flushPending := false.B
     flushIssued := false.B
-    when(io.tlbFlushDone.bits =/= BiRaError.none.U) {
+    when(io.tlbFlushDone.bits =/= ErrorCode.none.U) {
       recordGlobalError(
         io.tlbFlushDone.bits,
         0.U,

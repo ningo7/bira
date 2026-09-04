@@ -10,7 +10,7 @@ class BinPostProcSpec
     extends AnyFreeSpec
     with Matchers {
   "fused binary branches must add residual and saturate signed state" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 4,
       fullBanks = 3,
       binaryBanks = 2,
@@ -56,7 +56,9 @@ class BinPostProcSpec
       dut.io.inputValid.poke(true.B)
       dut.clock.step()
       dut.io.inputValid.poke(false.B)
-      dut.clock.step()
+      while (!dut.io.outputValid.peek().litToBoolean) {
+        dut.clock.step()
+      }
       dut.io.outputValid.expect(true.B)
       Seq(10, 14, 127, 22).zipWithIndex.foreach {
         case (expected, lane) =>

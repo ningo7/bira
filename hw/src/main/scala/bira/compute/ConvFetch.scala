@@ -11,7 +11,7 @@ import chisel3.util._
   * once and kept stationary in the controller while activation elements for
   * every output pixel are read through the other path.
   */
-class ConvFetch(p: BiRaParams) extends Module {
+class ConvFetch(p: AccelParams) extends Module {
   val io = IO(new Bundle {
     val actReq =
       Flipped(Decoupled(new ActivationFetchRequest(p)))
@@ -39,41 +39,22 @@ class ConvFetch(p: BiRaParams) extends Module {
       Flipped(Valid(Vec(p.dim, UInt(p.activationBits.W))))
   })
 
-  private val actActive = RegInit(false.B)
-  private val actReqReg =
-    Reg(new ActivationFetchRequest(p))
-  private val actIssued = RegInit(false.B)
-  private val actRow = Reg(Vec(p.dim, UInt(p.activationBits.W)))
-  private val actRespValid = RegInit(false.B)
+  // The scratchpad already has an explicit one-cycle synchronous-read
+  // latency. Forward activation requests directly instead of surrounding that
+  // latency with request and response holding states. ConvCtrl always enters
+  // its response-wait state when this request fires, so the non-backpressured
+  // SPAD response can be consumed directly one cycle later.
+  private val actLane = RegEnable(io.actReq.bits.lane, io.actReq.fire)
+  io.actReadReq.valid := io.actReq.valid
+  io.actReadReq.bits := io.actReq.bits.address
+  io.actReq.ready := io.actReadReq.ready
 
-  io.actReq.ready :=
-    !actActive && !actRespValid
-  io.actReadReq.valid := actActive && !actIssued
-  io.actReadReq.bits := actReqReg.address
-
-  when(io.actReq.fire) {
-    actReqReg := io.actReq.bits
-    actActive := true.B
-    actIssued := false.B
-  }
-
-  when(io.actReadReq.fire) {
-    actIssued := true.B
-  }
-
-  when(io.actReadResp.valid) {
-    actRow := io.actReadResp.bits
-    actActive := false.B
-    actRespValid := true.B
-  }
-
-  io.actResp.valid := actRespValid
+  io.actResp.valid := io.actReadResp.valid
   io.actResp.bits.activation :=
-    actRow(actReqReg.lane)
-  io.actResp.bits.row := actRow
-
-  when(io.actResp.fire) {
-    actRespValid := false.B
+    io.actReadResp.bits(actLane)
+  io.actResp.bits.row := io.actReadResp.bits
+  when(io.actReadResp.valid) {
+    assert(io.actResp.ready, "activation SPAD response must be consumed")
   }
 
   private val wgtActive = RegInit(false.B)

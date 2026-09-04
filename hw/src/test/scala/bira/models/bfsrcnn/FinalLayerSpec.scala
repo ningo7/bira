@@ -8,7 +8,7 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
 /** End-to-end test for the final 8-input/1-output W16 convolution mode. */
-class BfsrcnnFinalLayerSpec extends AnyFreeSpec with Matchers {
+class FinalLayerSpec extends AnyFreeSpec with Matchers {
   private def floorDivide(numerator: Int, denominator: Int): Int =
     Math.floorDiv(numerator, denominator)
 
@@ -54,11 +54,11 @@ class BfsrcnnFinalLayerSpec extends AnyFreeSpec with Matchers {
   }
 
   "final mode must reduce eight columns and pack sixteen output pixels per row" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 16,
       fullBanks = 5,
       binaryBanks = 2,
-      accumulatorBanks = 2,
+      accumulatorBanks = 1,
       bankRows = 128,
       maxImageHeight = 8,
       maxImageWidth = 12,
@@ -125,7 +125,7 @@ class BfsrcnnFinalLayerSpec extends AnyFreeSpec with Matchers {
     val residualBase = 3 * p.bankRows
     val outputBase = 4 * p.bankRows
 
-    simulate(new BiRaCore(p)) { dut =>
+    simulate(new Core(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.command.valid.poke(false.B)
       dut.io.binaryCommand.valid.poke(false.B)

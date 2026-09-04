@@ -7,7 +7,7 @@ import chisel3.simulator.EphemeralSimulator._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
-class BfsrcnnBinaryLayersSpec extends AnyFreeSpec with Matchers {
+class BinaryLayersSpec extends AnyFreeSpec with Matchers {
   private def signedByte(value: BigInt): Int = {
     val raw = value.toInt & 0xff
     if (raw >= 128) raw - 256 else raw
@@ -33,11 +33,11 @@ class BfsrcnnBinaryLayersSpec extends AnyFreeSpec with Matchers {
   }
 
   "two binary layers must execute XNOR, static -N, fused post, residual, and sign" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 16,
       fullBanks = 4,
       binaryBanks = 4,
-      accumulatorBanks = 2,
+      accumulatorBanks = 1,
       bankRows = 256,
       maxImageHeight = 2,
       maxImageWidth = 3,
@@ -123,9 +123,9 @@ class BfsrcnnBinaryLayersSpec extends AnyFreeSpec with Matchers {
     val layer0WeightBase = p.bankRows
     val layer1WeightBase = 2 * p.bankRows
     val correctionBase = 0
-    val accumulatorBase = p.bankRows
+    val accumulatorBase = 0
 
-    simulate(new BiRaCore(p)) { dut =>
+    simulate(new Core(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.command.valid.poke(false.B)
       dut.io.binaryCommand.valid.poke(false.B)

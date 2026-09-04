@@ -1,8 +1,8 @@
-#include "VBiRaStandaloneTop.h"
+#include "VStandaloneTop.h"
 #include "verilated.h"
 
 // BFSRCNN-specific trace replay and stage checking. The Verilated
-// BiRaStandaloneTop and its row-level memory protocol remain model-agnostic.
+// StandaloneTop and its row-level memory protocol remain model-agnostic.
 
 #include <algorithm>
 #include <array>
@@ -102,7 +102,7 @@ class Simulation {
  public:
   explicit Simulation(Fixture fixture)
       : fixture_(std::move(fixture)), context_(new VerilatedContext),
-        dut_(new VBiRaStandaloneTop(context_.get())) {
+        dut_(new VStandaloneTop(context_.get())) {
     max_cycles_ =
         std::max<uint64_t>(10000000u, fixture_.input_pixels * 100000u);
     dut_->clock = 0;
@@ -370,7 +370,7 @@ class Simulation {
 
   Fixture fixture_;
   std::unique_ptr<VerilatedContext> context_;
-  std::unique_ptr<VBiRaStandaloneTop> dut_;
+  std::unique_ptr<VStandaloneTop> dut_;
   uint64_t cycles_ = 0;
   uint64_t max_cycles_ = 0;
   bool read_pending_ = false;

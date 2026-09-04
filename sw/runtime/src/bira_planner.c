@@ -534,7 +534,7 @@ static int compile_layer(
     set_address(
         compiled,
         BIRA_ROLE_ACCUMULATOR,
-        runtime->capabilities.bank_rows);
+        0u);
     if (op->weight_high.data != NULL) {
         set_address(
             compiled,

@@ -6,7 +6,7 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
 /** Native controller-shaped test wrapper around dispatch and ComputeArray. */
-private class DispatchedComputeArray(p: BiRaParams) extends Module {
+private class DispatchedComputeArray(p: AccelParams) extends Module {
   val io = IO(new Bundle {
     val binaryMode = Input(Bool())
     val columnReduceMode = Input(Bool())
@@ -53,7 +53,7 @@ private class DispatchedComputeArray(p: BiRaParams) extends Module {
 /** Unit tests for native-layout normalization before the physical array. */
 class ComputeArrayDispatchSpec extends AnyFreeSpec with Matchers {
   "dispatch must produce one canonical bit-cell input for every precision" in {
-    val p = BiRaParams(dim = 16)
+    val p = AccelParams(dim = 16)
     val operandWeights =
       Seq(0x0001, 0x0002, 0x0004, 0x0008, 0x0001, 0x0002, 0x0000, 0x0001)
     val operandActivations =
@@ -112,6 +112,8 @@ class ComputeArrayDispatchSpec extends AnyFreeSpec with Matchers {
       dut.io.binaryInputValid.poke(true.B)
       dut.io.binaryActivation.poke(binaryActivation.U)
       dut.io.binaryWeights(0).poke(binaryWeight.U)
+      dut.io.output.valid.expect(false.B)
+      dut.clock.step()
       dut.io.output.valid.expect(true.B)
       dut.io.output.bits.binaryMode.expect(true.B)
       dut.io.output.bits.weightPrecision.expect(0.U)
@@ -124,11 +126,17 @@ class ComputeArrayDispatchSpec extends AnyFreeSpec with Matchers {
 
 /** Unit tests for dispatch plus the shared binary/multi-bit array. */
 class ComputeArraySpec extends AnyFreeSpec with Matchers {
-  private def runArray(dut: DispatchedComputeArray): Unit = {
+  private def runArray(
+    dut: DispatchedComputeArray,
+    binaryInput: Boolean = false
+  ): Unit = {
     dut.io.inputValid.poke(true.B)
     dut.clock.step()
     dut.io.inputValid.poke(false.B)
     dut.clock.step()
+    if (binaryInput) {
+      dut.clock.step()
+    }
     dut.io.outputValid.expect(true.B)
   }
 
@@ -142,7 +150,7 @@ class ComputeArraySpec extends AnyFreeSpec with Matchers {
 
   private def clearBinaryInputs(
     dut: DispatchedComputeArray,
-    p: BiRaParams
+    p: AccelParams
   ): Unit = {
     dut.io.binaryActivation.poke(0.U)
     dut.io.binaryWeights.foreach(_.poke(0.U))
@@ -150,7 +158,7 @@ class ComputeArraySpec extends AnyFreeSpec with Matchers {
 
   private def clearMultiInputs(
     dut: DispatchedComputeArray,
-    p: BiRaParams
+    p: AccelParams
   ): Unit = {
     for {
       operand <- 0 until p.maxWeightOperands
@@ -162,7 +170,7 @@ class ComputeArraySpec extends AnyFreeSpec with Matchers {
   }
 
   "AND mode must reconstruct a selected signed W16 weight" in {
-    val p = BiRaParams(dim = 16)
+    val p = AccelParams(dim = 16)
     val weights = Seq(
       -32768, -12345, -257, -1,
       0, 1, 2, 7,
@@ -199,7 +207,7 @@ class ComputeArraySpec extends AnyFreeSpec with Matchers {
   }
 
   "AND mode W4 must enter four products at the four-input tree level" in {
-    val p = BiRaParams(dim = 16)
+    val p = AccelParams(dim = 16)
     val weights = Seq.tabulate(4, p.dim) {
       case (operand, lane) => ((operand * 5 + lane * 3) % 16) - 8
     }
@@ -232,7 +240,7 @@ class ComputeArraySpec extends AnyFreeSpec with Matchers {
   }
 
   "XNOR mode must use all 16 cells and the full popcount tree" in {
-    val p = BiRaParams(dim = 16)
+    val p = AccelParams(dim = 16)
     val activation = Integer.parseInt("1011001011100001", 2)
     val weights = Seq(
       activation,
@@ -252,7 +260,7 @@ class ComputeArraySpec extends AnyFreeSpec with Matchers {
         val equal = Integer.bitCount((~(activation ^ weight)) & 0xffff)
         dut.io.binaryWeights(column).poke(weight.U)
       }
-      runArray(dut)
+      runArray(dut, binaryInput = true)
       for (column <- 0 until p.dim) {
         val weight = weights(column)
         val equal = Integer.bitCount((~(activation ^ weight)) & 0xffff)

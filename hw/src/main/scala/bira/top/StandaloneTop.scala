@@ -20,28 +20,28 @@ import _root_.circt.stage.ChiselStage
   * TileLink bridges below the same row requests; standalone simulation can
   * instead treat the address as a direct byte address.
   */
-class BiRaStandaloneTop(p: BiRaParams = BiRaParams()) extends Module {
+class StandaloneTop(p: AccelParams = AccelParams()) extends Module {
   val io = IO(new Bundle {
-    val command = Flipped(Decoupled(new BiRaRawCommand))
-    val response = Decoupled(new BiRaRawResponse)
+    val command = Flipped(Decoupled(new RawCmd))
+    val response = Decoupled(new RawResp)
 
     val dramReadRequest =
-      Decoupled(new BiRaExternalReadRequest)
+      Decoupled(new ExtReadReq)
     val dramReadResponse =
-      Flipped(Decoupled(new BiRaExternalReadResponse))
+      Flipped(Decoupled(new ExtReadResp))
     val dramWriteRequest =
-      Decoupled(new BiRaExternalWriteRequest)
+      Decoupled(new ExtWriteReq)
     val dramWriteResponse =
-      Flipped(Decoupled(new BiRaExternalWriteResponse))
+      Flipped(Decoupled(new ExtWriteResp))
 
-    val schedulerStatus = Output(new BiRaSchedulerStatus)
+    val schedulerStatus = Output(new SchedStatus)
     val busy = Output(Bool())
   })
 
-  private val control = Module(new BiRaControlPlane(p))
-  private val load = Module(new BiRaLoadCtrl(p))
-  private val store = Module(new BiRaStoreCtrl(p))
-  private val dataPlane = Module(new BiRaDataPlane(p))
+  private val control = Module(new ControlPlane(p))
+  private val load = Module(new LoadCtrl(p))
+  private val store = Module(new StoreCtrl(p))
+  private val dataPlane = Module(new DataPlane(p))
 
   control.io.loadIssue <> load.io.task
   control.io.execIssue <> dataPlane.io.execTask
@@ -73,7 +73,7 @@ class BiRaStandaloneTop(p: BiRaParams = BiRaParams()) extends Module {
   private val flushDone = RegNext(flushAccepted, false.B)
   control.io.tlbFlush.ready := true.B
   control.io.tlbFlushDone.valid := flushDone
-  control.io.tlbFlushDone.bits := BiRaError.none.U
+  control.io.tlbFlushDone.bits := ErrorCode.none.U
 
   io.schedulerStatus := control.io.status
   io.busy :=
@@ -86,11 +86,11 @@ class BiRaStandaloneTop(p: BiRaParams = BiRaParams()) extends Module {
 }
 
 /** Generate the complete non-Rocket top for a C++ Verilator harness. */
-object GenBiRaStandaloneTop extends App {
+object GenStandaloneTop extends App {
   private val targetDir =
     args.headOption.getOrElse("build/generated-rtl")
   ChiselStage.emitSystemVerilogFile(
-    new BiRaStandaloneTop(),
+    new StandaloneTop(),
     args = Array("--target-dir", targetDir),
     firtoolOpts = Array(
       "-disable-all-randomization",

@@ -7,7 +7,7 @@ import unittest
 BIRA_ROOT = Path(__file__).resolve().parents[1]
 
 
-class BiRaOperatorsTest(unittest.TestCase):
+class OperatorsTest(unittest.TestCase):
     def test_dense_conv_automatically_tiles_and_rotates_contexts(self):
         with tempfile.TemporaryDirectory() as directory:
             executable = Path(directory) / 'test_bira_ops'

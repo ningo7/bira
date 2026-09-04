@@ -16,7 +16,7 @@ import scala.collection.mutable
 /** Replays the exact command and DRAM images emitted by the generated C
   * software stack. No layer sequence is duplicated in Scala.
   */
-class BfsrcnnTraceReplaySpec extends AnyFreeSpec with Matchers {
+class TraceReplaySpec extends AnyFreeSpec with Matchers {
   private case class TraceCommand(
     funct: Int,
     returnsValue: Boolean,
@@ -112,8 +112,8 @@ class BfsrcnnTraceReplaySpec extends AnyFreeSpec with Matchers {
           ((data >> (8 * byte)) & 0xff).toInt
       }
 
-    val p = BiRaParams()
-    simulate(new BiRaStandaloneTop(p)) { dut =>
+    val p = AccelParams()
+    simulate(new StandaloneTop(p)) { dut =>
       var cycleCount = 0L
       val maxCycles = math.max(
         10000000L,
@@ -147,9 +147,9 @@ class BfsrcnnTraceReplaySpec extends AnyFreeSpec with Matchers {
         dut.io.dramReadResponse.bits.data.poke(
           readResponse.getOrElse(BigInt(0)).U
         )
-        dut.io.dramReadResponse.bits.errorCode.poke(BiRaError.none.U)
+        dut.io.dramReadResponse.bits.errorCode.poke(ErrorCode.none.U)
         dut.io.dramWriteResponse.valid.poke(writeResponsePending.B)
-        dut.io.dramWriteResponse.bits.errorCode.poke(BiRaError.none.U)
+        dut.io.dramWriteResponse.bits.errorCode.poke(ErrorCode.none.U)
 
         val commandFire =
           dut.io.command.valid.peek().litToBoolean &&
@@ -236,9 +236,9 @@ class BfsrcnnTraceReplaySpec extends AnyFreeSpec with Matchers {
             tick()
           }
           val result = responses.dequeue()
-          if (command.funct == BiRaFunct.fence) {
+          if (command.funct == Funct.fence) {
             (result & 1) mustBe 1
-            ((result >> 1) & 0xff) mustBe BiRaError.none
+            ((result >> 1) & 0xff) mustBe ErrorCode.none
             val elapsed = cycleCount - phaseStartCycle
             if (fenceIndex < 2 * (layerNames.length - 1)) {
               val layer = layerNames(fenceIndex / 2)
@@ -258,7 +258,7 @@ class BfsrcnnTraceReplaySpec extends AnyFreeSpec with Matchers {
 
       fenceIndex mustBe 2 * layerNames.length - 1
       layerCycles.map(_._1).toSeq mustBe layerNames
-      val stores = fixture.commands.filter(_.funct == BiRaFunct.store2d)
+      val stores = fixture.commands.filter(_.funct == Funct.store2d)
       val pixels = fixture.inputPixels
       val stageSizes =
         Seq(pixels * 48, pixels * 32, pixels * 32) ++

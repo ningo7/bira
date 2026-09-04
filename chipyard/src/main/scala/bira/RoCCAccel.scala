@@ -12,31 +12,31 @@ import freechips.rocketchip.tilelink.TLEdgeOut
   * The default 8-byte DMA beat matches the standard Rocket/Chipyard system
   * bus. All compute and ISA modules remain in the Rocket-independent hw tree.
   */
-class BiRaRoCC(
-  val biraParams: BiRaParams = BiRaParams(dmaBeatBytes = 8),
+class RoCCAccel(
+  val cfg: AccelParams = AccelParams(dmaBeatBytes = 8),
   opcodes: OpcodeSet = OpcodeSet.custom3
 )(implicit parameters: Parameters)
     extends LazyRoCC(opcodes = opcodes, nPTWPorts = 2) {
-  val dma = LazyModule(new BiRaTileLinkDma(biraParams))
+  val dma = LazyModule(new TileLinkDma(cfg))
   override val atlNode = dma.node
-  override lazy val module = new BiRaRoCCModule(this)
+  override lazy val module = new RoCCAccelImp(this)
 }
 
-class BiRaRoCCModule(
-  outer: BiRaRoCC
+class RoCCAccelImp(
+  outer: RoCCAccel
 )(implicit parameters: Parameters)
     extends LazyRoCCModuleImp(outer) {
-  private val biraParams = outer.biraParams
+  private val cfg = outer.cfg
   private val control =
-    Module(new BiRaControlPlane(biraParams))
-  private val load = Module(new BiRaLoadCtrl(biraParams))
-  private val store = Module(new BiRaStoreCtrl(biraParams))
+    Module(new ControlPlane(cfg))
+  private val load = Module(new LoadCtrl(cfg))
+  private val store = Module(new StoreCtrl(cfg))
   private val readVm =
-    Module(new BiRaVirtualReadDma(biraParams))
+    Module(new VmReadDma(cfg))
   private val writeVm =
-    Module(new BiRaVirtualWriteDma(biraParams))
+    Module(new VmWriteDma(cfg))
   private val dataPlane =
-    Module(new BiRaDataPlane(biraParams))
+    Module(new DataPlane(cfg))
 
   control.io.loadIssue <> load.io.task
   control.io.storeIssue <> store.io.task
@@ -68,9 +68,9 @@ class BiRaRoCCModule(
   implicit private val tlEdge: TLEdgeOut =
     outer.dma.node.edges.out.head
   private val loadTlb =
-    Module(new BiRaRocketTlbAdapter(biraParams))
+    Module(new RocketTlb(cfg))
   private val storeTlb =
-    Module(new BiRaRocketTlbAdapter(biraParams))
+    Module(new RocketTlb(cfg))
   readVm.io.translationRequest <> loadTlb.io.request
   readVm.io.translationResponse <> loadTlb.io.response
   writeVm.io.translationRequest <> storeTlb.io.request
@@ -84,7 +84,7 @@ class BiRaRoCCModule(
   storeTlb.io.flush := flushPulse
   control.io.tlbFlushDone.valid :=
     loadTlb.io.flushDone && storeTlb.io.flushDone
-  control.io.tlbFlushDone.bits := BiRaError.none.U
+  control.io.tlbFlushDone.bits := ErrorCode.none.U
 
   control.io.command.valid := io.cmd.valid
   control.io.command.bits.funct := io.cmd.bits.inst.funct
@@ -126,15 +126,15 @@ class BiRaRoCCModule(
 }
 
 /** Add this fragment instead of a Gemmini BuildRoCC fragment. */
-class WithBiRaRoCC(
-  biraParams: BiRaParams = BiRaParams(dmaBeatBytes = 8)
+class WithRoCCAccel(
+  cfg: AccelParams = AccelParams(dmaBeatBytes = 8)
 ) extends Config((site, here, up) => {
   case BuildRoCC =>
     up(BuildRoCC) ++ Seq(
       (parameters: Parameters) =>
         LazyModule(
-          new BiRaRoCC(
-            biraParams = biraParams,
+          new RoCCAccel(
+            cfg = cfg,
             opcodes = OpcodeSet.custom3
           )(parameters)
         )

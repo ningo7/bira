@@ -5,8 +5,8 @@ import chisel3.simulator.EphemeralSimulator._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
-class BiRaVirtualDmaSpec extends AnyFreeSpec with Matchers {
-  private val p = BiRaParams(
+class VmDmaSpec extends AnyFreeSpec with Matchers {
+  private val p = AccelParams(
     dmaBeatBytes = 8,
     pageBytes = 16
   )
@@ -18,7 +18,7 @@ class BiRaVirtualDmaSpec extends AnyFreeSpec with Matchers {
     }
 
   "read bridge splits at a page, aligns beats, and reassembles bytes" in {
-    simulate(new BiRaVirtualReadDma(p)) { dut =>
+    simulate(new VmReadDma(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.request.valid.poke(false.B)
       dut.io.response.ready.poke(false.B)
@@ -46,7 +46,7 @@ class BiRaVirtualDmaSpec extends AnyFreeSpec with Matchers {
         dut.clock.step()
 
         dut.io.translationResponse.bits.physicalAddress.poke(physical.U)
-        dut.io.translationResponse.bits.errorCode.poke(BiRaError.none.U)
+        dut.io.translationResponse.bits.errorCode.poke(ErrorCode.none.U)
         dut.io.translationResponse.valid.poke(true.B)
         dut.io.translationResponse.ready.expect(true.B)
         dut.clock.step()
@@ -60,7 +60,7 @@ class BiRaVirtualDmaSpec extends AnyFreeSpec with Matchers {
         dut.clock.step()
 
         dut.io.physicalResponse.bits.data.poke(packBytes(bytes).U)
-        dut.io.physicalResponse.bits.errorCode.poke(BiRaError.none.U)
+        dut.io.physicalResponse.bits.errorCode.poke(ErrorCode.none.U)
         dut.io.physicalResponse.valid.poke(true.B)
         dut.io.physicalResponse.ready.expect(true.B)
         dut.clock.step()
@@ -82,7 +82,7 @@ class BiRaVirtualDmaSpec extends AnyFreeSpec with Matchers {
       )
 
       dut.io.response.valid.expect(true.B)
-      dut.io.response.bits.errorCode.expect(BiRaError.none.U)
+      dut.io.response.bits.errorCode.expect(ErrorCode.none.U)
       dut.io.response.bits.data.expect(
         packBytes(Seq(0xa6, 0xa7, 0xb0, 0xb1, 0xb2, 0xb3)).U
       )
@@ -92,7 +92,7 @@ class BiRaVirtualDmaSpec extends AnyFreeSpec with Matchers {
   }
 
   "write bridge splits at a page and creates aligned partial-write masks" in {
-    simulate(new BiRaVirtualWriteDma(p)) { dut =>
+    simulate(new VmWriteDma(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.request.valid.poke(false.B)
       dut.io.response.ready.poke(false.B)
@@ -123,7 +123,7 @@ class BiRaVirtualDmaSpec extends AnyFreeSpec with Matchers {
         dut.clock.step()
 
         dut.io.translationResponse.bits.physicalAddress.poke(physical.U)
-        dut.io.translationResponse.bits.errorCode.poke(BiRaError.none.U)
+        dut.io.translationResponse.bits.errorCode.poke(ErrorCode.none.U)
         dut.io.translationResponse.valid.poke(true.B)
         dut.clock.step()
         dut.io.translationResponse.valid.poke(false.B)
@@ -141,7 +141,7 @@ class BiRaVirtualDmaSpec extends AnyFreeSpec with Matchers {
         dut.io.physicalRequest.bits.data.expect(expectedData.U)
         dut.clock.step()
 
-        dut.io.physicalResponse.bits.errorCode.poke(BiRaError.none.U)
+        dut.io.physicalResponse.bits.errorCode.poke(ErrorCode.none.U)
         dut.io.physicalResponse.valid.poke(true.B)
         dut.io.physicalResponse.ready.expect(true.B)
         dut.clock.step()
@@ -165,14 +165,14 @@ class BiRaVirtualDmaSpec extends AnyFreeSpec with Matchers {
       )
 
       dut.io.response.valid.expect(true.B)
-      dut.io.response.bits.errorCode.expect(BiRaError.none.U)
+      dut.io.response.bits.errorCode.expect(ErrorCode.none.U)
       dut.io.response.ready.poke(true.B)
       dut.clock.step()
     }
   }
 
   "translation errors terminate the row without issuing a physical request" in {
-    simulate(new BiRaVirtualReadDma(p)) { dut =>
+    simulate(new VmReadDma(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.request.valid.poke(false.B)
       dut.io.response.ready.poke(false.B)
@@ -193,14 +193,14 @@ class BiRaVirtualDmaSpec extends AnyFreeSpec with Matchers {
       dut.io.translationRequest.valid.expect(true.B)
       dut.clock.step()
       dut.io.translationResponse.bits.physicalAddress.poke(0.U)
-      dut.io.translationResponse.bits.errorCode.poke(BiRaError.tlb.U)
+      dut.io.translationResponse.bits.errorCode.poke(ErrorCode.tlb.U)
       dut.io.translationResponse.valid.poke(true.B)
       dut.clock.step()
       dut.io.translationResponse.valid.poke(false.B)
 
       dut.io.physicalRequest.valid.expect(false.B)
       dut.io.response.valid.expect(true.B)
-      dut.io.response.bits.errorCode.expect(BiRaError.tlb.U)
+      dut.io.response.bits.errorCode.expect(ErrorCode.tlb.U)
     }
   }
 }

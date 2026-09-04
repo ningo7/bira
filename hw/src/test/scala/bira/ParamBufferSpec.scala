@@ -6,7 +6,7 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
 /** Checks the frozen 256-bit lane-record ABI in both interpretations. */
-class BiRaParameterBufferSpec extends AnyFreeSpec with Matchers {
+class ParamBufferSpec extends AnyFreeSpec with Matchers {
   private def bits(value: BigInt, width: Int): BigInt =
     value & ((BigInt(1) << width) - 1)
 
@@ -51,7 +51,7 @@ class BiRaParameterBufferSpec extends AnyFreeSpec with Matchers {
   }
 
   "raw DMA rows decode into multi-bit and binary parameter blocks" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 4,
       fullBanks = 4,
       binaryBanks = 2,
@@ -64,7 +64,7 @@ class BiRaParameterBufferSpec extends AnyFreeSpec with Matchers {
       maxOutputBlocks = 4
     )
 
-    simulate(new BiRaParameterBuffer(p)) { dut =>
+    simulate(new ParamBuffer(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.write.valid.poke(false.B)
       dut.io.readRequest.valid.poke(false.B)

@@ -10,34 +10,34 @@ import chisel3.util._
   * `translationStatus` remains opaque in the standalone core. The later
   * FrontendTLB adapter converts it to Rocket's privilege/status fields.
   */
-class BiRaTranslationRequest extends Bundle {
+class TranslationReq extends Bundle {
   val virtualAddress = UInt(64.W)
   val isWrite = Bool()
   val translationStatus = UInt(64.W)
 }
 
-class BiRaTranslationResponse extends Bundle {
+class TranslationResp extends Bundle {
   val physicalAddress = UInt(64.W)
   val errorCode = UInt(8.W)
 }
 
 /** Fixed-width physical bus beat used below the virtual DMA bridges. */
-class BiRaPhysicalReadRequest extends Bundle {
+class PhysReadReq extends Bundle {
   val physicalAddress = UInt(64.W)
 }
 
-class BiRaPhysicalReadResponse(p: BiRaParams) extends Bundle {
+class PhysReadResp(p: AccelParams) extends Bundle {
   val data = UInt((p.dmaBeatBytes * 8).W)
   val errorCode = UInt(8.W)
 }
 
-class BiRaPhysicalWriteRequest(p: BiRaParams) extends Bundle {
+class PhysWriteReq(p: AccelParams) extends Bundle {
   val physicalAddress = UInt(64.W)
   val data = UInt((p.dmaBeatBytes * 8).W)
   val mask = UInt(p.dmaBeatBytes.W)
 }
 
-class BiRaPhysicalWriteResponse extends Bundle {
+class PhysWriteResp extends Bundle {
   val errorCode = UInt(8.W)
 }
 
@@ -46,14 +46,14 @@ class BiRaPhysicalWriteResponse extends Bundle {
   * Every physical request is one aligned fixed-width beat. A fragment never
   * crosses either that beat or a virtual page.
   */
-private object BiRaVirtualDmaHelpers {
+private object VmDmaUtil {
   def minimum(a: UInt, b: UInt): UInt = Mux(a < b, a, b)
 
   def fragmentBytes(
     virtualAddress: UInt,
     physicalAddress: UInt,
     remaining: UInt,
-    p: BiRaParams
+    p: AccelParams
   ): UInt = {
     val virtualPageOffset =
       virtualAddress(p.pageOffsetBits - 1, 0)
@@ -66,7 +66,7 @@ private object BiRaVirtualDmaHelpers {
     minimum(remaining, minimum(pageRemaining, beatRemaining))
   }
 
-  def alignedBeatAddress(address: UInt, p: BiRaParams): UInt =
+  def alignedBeatAddress(address: UInt, p: AccelParams): UInt =
     Cat(
       address(63, p.dmaBeatOffsetBits),
       0.U(p.dmaBeatOffsetBits.W)
@@ -75,7 +75,7 @@ private object BiRaVirtualDmaHelpers {
   def pageOffsetsMatch(
     virtualAddress: UInt,
     physicalAddress: UInt,
-    p: BiRaParams
+    p: AccelParams
   ): Bool =
     virtualAddress(p.pageOffsetBits - 1, 0) ===
       physicalAddress(p.pageOffsetBits - 1, 0)
@@ -103,18 +103,18 @@ private object BiRaVirtualDmaHelpers {
   * beat reads, extracts only requested bytes, and assembles one 512-bit row.
   * The translator naturally sees a new request when the row crosses a page.
   */
-class BiRaVirtualReadDma(p: BiRaParams) extends Module {
+class VmReadDma(p: AccelParams) extends Module {
   val io = IO(new Bundle {
-    val request = Flipped(Decoupled(new BiRaExternalReadRequest))
-    val response = Decoupled(new BiRaExternalReadResponse)
+    val request = Flipped(Decoupled(new ExtReadReq))
+    val response = Decoupled(new ExtReadResp)
 
-    val translationRequest = Decoupled(new BiRaTranslationRequest)
+    val translationRequest = Decoupled(new TranslationReq)
     val translationResponse =
-      Flipped(Decoupled(new BiRaTranslationResponse))
+      Flipped(Decoupled(new TranslationResp))
 
-    val physicalRequest = Decoupled(new BiRaPhysicalReadRequest)
+    val physicalRequest = Decoupled(new PhysReadReq)
     val physicalResponse =
-      Flipped(Decoupled(new BiRaPhysicalReadResponse(p)))
+      Flipped(Decoupled(new PhysReadResp(p)))
   })
 
   private val Seq(
@@ -127,7 +127,7 @@ class BiRaVirtualReadDma(p: BiRaParams) extends Module {
   ) = Enum(6)
   private val state = RegInit(idle)
 
-  private val requestReg = Reg(new BiRaExternalReadRequest)
+  private val requestReg = Reg(new ExtReadReq)
   private val currentVirtualAddress = Reg(UInt(64.W))
   private val physicalBeatAddress = Reg(UInt(64.W))
   private val remainingBytes = Reg(UInt(7.W))
@@ -136,7 +136,7 @@ class BiRaVirtualReadDma(p: BiRaParams) extends Module {
     Reg(UInt(p.dmaBeatOffsetBits.W))
   private val fragmentByteCount = Reg(UInt(7.W))
   private val assembledData = RegInit(0.U(512.W))
-  private val responseError = RegInit(BiRaError.none.U(8.W))
+  private val responseError = RegInit(ErrorCode.none.U(8.W))
 
   io.request.ready := state === idle
   when(io.request.fire) {
@@ -148,8 +148,8 @@ class BiRaVirtualReadDma(p: BiRaParams) extends Module {
     responseError := Mux(
       io.request.bits.bytes === 0.U ||
         io.request.bits.bytes > 64.U,
-      BiRaError.internalProtocol.U,
-      BiRaError.none.U
+      ErrorCode.internalProtocol.U,
+      ErrorCode.none.U
     )
     state := Mux(
       io.request.bits.bytes === 0.U ||
@@ -171,27 +171,27 @@ class BiRaVirtualReadDma(p: BiRaParams) extends Module {
 
   io.translationResponse.ready := state === waitTranslation
   when(io.translationResponse.fire) {
-    when(io.translationResponse.bits.errorCode =/= BiRaError.none.U) {
+    when(io.translationResponse.bits.errorCode =/= ErrorCode.none.U) {
       responseError := io.translationResponse.bits.errorCode
       state := respond
     }.elsewhen(
-      !BiRaVirtualDmaHelpers.pageOffsetsMatch(
+      !VmDmaUtil.pageOffsetsMatch(
         currentVirtualAddress,
         io.translationResponse.bits.physicalAddress,
         p
       )
     ) {
-      responseError := BiRaError.internalProtocol.U
+      responseError := ErrorCode.internalProtocol.U
       state := respond
     }.otherwise {
-      val fragment = BiRaVirtualDmaHelpers.fragmentBytes(
+      val fragment = VmDmaUtil.fragmentBytes(
         currentVirtualAddress,
         io.translationResponse.bits.physicalAddress,
         remainingBytes,
         p
       )
       physicalBeatAddress :=
-        BiRaVirtualDmaHelpers.alignedBeatAddress(
+        VmDmaUtil.alignedBeatAddress(
           io.translationResponse.bits.physicalAddress,
           p
         )
@@ -214,7 +214,7 @@ class BiRaVirtualReadDma(p: BiRaParams) extends Module {
 
   io.physicalResponse.ready := state === waitPhysical
   when(io.physicalResponse.fire) {
-    when(io.physicalResponse.bits.errorCode =/= BiRaError.none.U) {
+    when(io.physicalResponse.bits.errorCode =/= ErrorCode.none.U) {
       responseError := io.physicalResponse.bits.errorCode
       state := respond
     }.otherwise {
@@ -222,7 +222,7 @@ class BiRaVirtualReadDma(p: BiRaParams) extends Module {
         io.physicalResponse.bits.data >>
           (beatByteOffset << 3)
       val fragmentMask =
-        BiRaVirtualDmaHelpers.lowDataMask(fragmentByteCount)
+        VmDmaUtil.lowDataMask(fragmentByteCount)
       val selected =
         shiftedBeat.pad(512) & fragmentMask
       val merged =
@@ -231,7 +231,7 @@ class BiRaVirtualReadDma(p: BiRaParams) extends Module {
       assembledData := merged
 
       when(remainingBytes === fragmentByteCount) {
-        responseError := BiRaError.none.U
+        responseError := ErrorCode.none.U
         state := respond
       }.otherwise {
         currentVirtualAddress :=
@@ -254,19 +254,19 @@ class BiRaVirtualReadDma(p: BiRaParams) extends Module {
 }
 
 /** Virtual row-write bridge using aligned masked physical beats. */
-class BiRaVirtualWriteDma(p: BiRaParams) extends Module {
+class VmWriteDma(p: AccelParams) extends Module {
   val io = IO(new Bundle {
-    val request = Flipped(Decoupled(new BiRaExternalWriteRequest))
-    val response = Decoupled(new BiRaExternalWriteResponse)
+    val request = Flipped(Decoupled(new ExtWriteReq))
+    val response = Decoupled(new ExtWriteResp)
 
-    val translationRequest = Decoupled(new BiRaTranslationRequest)
+    val translationRequest = Decoupled(new TranslationReq)
     val translationResponse =
-      Flipped(Decoupled(new BiRaTranslationResponse))
+      Flipped(Decoupled(new TranslationResp))
 
     val physicalRequest =
-      Decoupled(new BiRaPhysicalWriteRequest(p))
+      Decoupled(new PhysWriteReq(p))
     val physicalResponse =
-      Flipped(Decoupled(new BiRaPhysicalWriteResponse))
+      Flipped(Decoupled(new PhysWriteResp))
   })
 
   private val Seq(
@@ -279,7 +279,7 @@ class BiRaVirtualWriteDma(p: BiRaParams) extends Module {
   ) = Enum(6)
   private val state = RegInit(idle)
 
-  private val requestReg = Reg(new BiRaExternalWriteRequest)
+  private val requestReg = Reg(new ExtWriteReq)
   private val currentVirtualAddress = Reg(UInt(64.W))
   private val physicalBeatAddress = Reg(UInt(64.W))
   private val remainingBytes = Reg(UInt(7.W))
@@ -287,7 +287,7 @@ class BiRaVirtualWriteDma(p: BiRaParams) extends Module {
   private val beatByteOffset =
     Reg(UInt(p.dmaBeatOffsetBits.W))
   private val fragmentByteCount = Reg(UInt(7.W))
-  private val responseError = RegInit(BiRaError.none.U(8.W))
+  private val responseError = RegInit(ErrorCode.none.U(8.W))
 
   io.request.ready := state === idle
   when(io.request.fire) {
@@ -298,8 +298,8 @@ class BiRaVirtualWriteDma(p: BiRaParams) extends Module {
     responseError := Mux(
       io.request.bits.bytes === 0.U ||
         io.request.bits.bytes > 64.U,
-      BiRaError.internalProtocol.U,
-      BiRaError.none.U
+      ErrorCode.internalProtocol.U,
+      ErrorCode.none.U
     )
     state := Mux(
       io.request.bits.bytes === 0.U ||
@@ -321,27 +321,27 @@ class BiRaVirtualWriteDma(p: BiRaParams) extends Module {
 
   io.translationResponse.ready := state === waitTranslation
   when(io.translationResponse.fire) {
-    when(io.translationResponse.bits.errorCode =/= BiRaError.none.U) {
+    when(io.translationResponse.bits.errorCode =/= ErrorCode.none.U) {
       responseError := io.translationResponse.bits.errorCode
       state := respond
     }.elsewhen(
-      !BiRaVirtualDmaHelpers.pageOffsetsMatch(
+      !VmDmaUtil.pageOffsetsMatch(
         currentVirtualAddress,
         io.translationResponse.bits.physicalAddress,
         p
       )
     ) {
-      responseError := BiRaError.internalProtocol.U
+      responseError := ErrorCode.internalProtocol.U
       state := respond
     }.otherwise {
-      val fragment = BiRaVirtualDmaHelpers.fragmentBytes(
+      val fragment = VmDmaUtil.fragmentBytes(
         currentVirtualAddress,
         io.translationResponse.bits.physicalAddress,
         remainingBytes,
         p
       )
       physicalBeatAddress :=
-        BiRaVirtualDmaHelpers.alignedBeatAddress(
+        VmDmaUtil.alignedBeatAddress(
           io.translationResponse.bits.physicalAddress,
           p
         )
@@ -358,9 +358,9 @@ class BiRaVirtualWriteDma(p: BiRaParams) extends Module {
   private val sourceShifted =
     requestReg.data >> (inputByteOffset << 3)
   private val fragmentMask =
-    BiRaVirtualDmaHelpers.lowDataMask(fragmentByteCount)
+    VmDmaUtil.lowDataMask(fragmentByteCount)
   private val fragmentByteEnable =
-    BiRaVirtualDmaHelpers.lowByteEnable(fragmentByteCount)
+    VmDmaUtil.lowByteEnable(fragmentByteCount)
   private val selectedSource =
     sourceShifted & fragmentMask
   private val positionedData =
@@ -382,11 +382,11 @@ class BiRaVirtualWriteDma(p: BiRaParams) extends Module {
 
   io.physicalResponse.ready := state === waitPhysical
   when(io.physicalResponse.fire) {
-    when(io.physicalResponse.bits.errorCode =/= BiRaError.none.U) {
+    when(io.physicalResponse.bits.errorCode =/= ErrorCode.none.U) {
       responseError := io.physicalResponse.bits.errorCode
       state := respond
     }.elsewhen(remainingBytes === fragmentByteCount) {
-      responseError := BiRaError.none.U
+      responseError := ErrorCode.none.U
       state := respond
     }.otherwise {
       currentVirtualAddress :=

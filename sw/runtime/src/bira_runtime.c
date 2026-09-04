@@ -66,10 +66,10 @@ bira_capabilities_t bira_default_capabilities(void)
     capabilities.parameter_rows = 512u;
     capabilities.full_banks = 10u;
     capabilities.binary_banks = 4u;
-    capabilities.accumulator_banks = 2u;
+    capabilities.accumulator_banks = 1u;
     /*
      * The ISA context-id field can encode eight values, while the current
-     * BiRaParams hardware instance implements four physical contexts.
+     * AccelParams hardware instance implements four physical contexts.
      */
     capabilities.contexts = 4u;
     capabilities.max_image_height = 128u;

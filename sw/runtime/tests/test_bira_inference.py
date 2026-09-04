@@ -7,7 +7,7 @@ import unittest
 BIRA_ROOT = Path(__file__).resolve().parents[1]
 
 
-class BiRaInferenceTest(unittest.TestCase):
+class InferenceTest(unittest.TestCase):
     def test_multilayer_residency_and_standalone_layer(self):
         with tempfile.TemporaryDirectory() as directory:
             executable = Path(directory) / "test_bira_inference"

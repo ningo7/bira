@@ -11,7 +11,7 @@ import chisel3.util._
   * bit vectors per physical column. Bit `cell` of the two vectors always
   * drives the same configurable bit cell, regardless of the source mode.
   */
-class ComputeArrayInput(p: BiRaParams) extends Bundle {
+class ComputeArrayInput(p: AccelParams) extends Bundle {
   val activations = Vec(p.dim, UInt(p.weightBits.W))
   val weights = Vec(p.dim, UInt(p.weightBits.W))
   val binaryMode = Bool()
@@ -20,7 +20,7 @@ class ComputeArrayInput(p: BiRaParams) extends Bundle {
 }
 
 /** Selects a controller and normalizes its native layout for ComputeArray. */
-class ComputeArrayDispatch(p: BiRaParams) extends Module {
+class ComputeArrayDispatch(p: AccelParams) extends Module {
   val io = IO(new Bundle {
     val binaryMode = Input(Bool())
 
@@ -45,18 +45,14 @@ class ComputeArrayDispatch(p: BiRaParams) extends Module {
     val output = Valid(new ComputeArrayInput(p))
   })
 
-  io.output.valid := Mux(
-    io.binaryMode,
-    io.binaryInputValid,
-    io.multiInputValid
-  )
-  io.output.bits.binaryMode := io.binaryMode
-  io.output.bits.weightPrecision := Mux(
+  private val selectedInput = Wire(new ComputeArrayInput(p))
+  selectedInput.binaryMode := io.binaryMode
+  selectedInput.weightPrecision := Mux(
     io.binaryMode,
     0.U,
     io.weightPrecision
   )
-  io.output.bits.columnReduceMode :=
+  selectedInput.columnReduceMode :=
     !io.binaryMode && io.columnReduceMode
 
   for (column <- 0 until p.dim) {
@@ -105,10 +101,33 @@ class ComputeArrayDispatch(p: BiRaParams) extends Module {
       )
     }
 
-    io.output.bits.activations(column) :=
+    selectedInput.activations(column) :=
       activationCells.asUInt
-    io.output.bits.weights(column) := weightCells.asUInt
+    selectedInput.weights(column) := weightCells.asUInt
   }
+
+  // Binary activations originate at synchronous SPAD BRAMs. Register the
+  // canonical array input after bank/controller/format selection so BRAM
+  // clock-to-output and the first AddTree carry chain cannot share a cycle.
+  // The multi-bit path remains at its existing latency; both paths retain
+  // an initiation interval of one cycle.
+  private val binaryStageValid =
+    RegNext(io.binaryMode && io.binaryInputValid, false.B)
+  private val binaryStageBits = Reg(new ComputeArrayInput(p))
+  when(io.binaryMode && io.binaryInputValid) {
+    binaryStageBits := selectedInput
+  }
+
+  io.output.valid := Mux(
+    io.binaryMode,
+    binaryStageValid,
+    io.multiInputValid
+  )
+  io.output.bits := Mux(
+    io.binaryMode,
+    binaryStageBits,
+    selectedInput
+  )
 }
 
 /** One physical compute tile shared by packed-binary and multi-bit modes.
@@ -124,7 +143,7 @@ class ComputeArrayDispatch(p: BiRaParams) extends Module {
   * two's-complement bit weights; the resulting 8/4/2/1 channel products enter
   * the matching level of the same tree.
   */
-class ComputeArray(p: BiRaParams) extends Module {
+class ComputeArray(p: AccelParams) extends Module {
   private val cellCount = p.weightBits
   require(cellCount == 16)
   require(p.dim <= cellCount)
@@ -157,8 +176,11 @@ class ComputeArray(p: BiRaParams) extends Module {
     width: Int
   ): SInt = {
     require(bits.length == width)
-    Cat(bits.reverse).asSInt.pad(p.accumulatorBits)
+    Cat(bits.reverse).asSInt.pad(p.arraySumBits)
   }
+
+  private val narrowColumnSums =
+    Wire(Vec(p.dim, SInt(p.arraySumBits.W)))
 
   for (column <- 0 until p.dim) {
     val cellResults = Wire(Vec(cellCount, Bool()))
@@ -174,7 +196,7 @@ class ComputeArray(p: BiRaParams) extends Module {
         bothOne || (io.input.bits.binaryMode && bothZero)
     }
 
-    val tree = Module(new AddTree(p.accumulatorBits))
+    val tree = Module(new AddTree(p.arraySumBits))
     for (treeInput <- 0 until 16) {
       val multiProduct =
         if (treeInput < p.maxWeightOperands) {
@@ -185,7 +207,7 @@ class ComputeArray(p: BiRaParams) extends Module {
                 16
               )
             } else {
-              0.S(p.accumulatorBits.W)
+              0.S(p.arraySumBits.W)
             }
           val product8 =
             if (treeInput < 2) {
@@ -196,7 +218,7 @@ class ComputeArray(p: BiRaParams) extends Module {
                 8
               )
             } else {
-              0.S(p.accumulatorBits.W)
+              0.S(p.arraySumBits.W)
             }
           val product4 =
             if (treeInput < 4) {
@@ -207,7 +229,7 @@ class ComputeArray(p: BiRaParams) extends Module {
                 4
               )
             } else {
-              0.S(p.accumulatorBits.W)
+              0.S(p.arraySumBits.W)
             }
           val product2 = signedGroup(
             (0 until 2).map(index =>
@@ -218,7 +240,7 @@ class ComputeArray(p: BiRaParams) extends Module {
 
           MuxLookup(
             io.input.bits.weightPrecision,
-            0.S(p.accumulatorBits.W)
+            0.S(p.arraySumBits.W)
           )(
             Seq(
               16.U -> product16,
@@ -228,7 +250,7 @@ class ComputeArray(p: BiRaParams) extends Module {
             )
           )
         } else {
-          0.S(p.accumulatorBits.W)
+          0.S(p.arraySumBits.W)
         }
 
       tree.io.inputs(treeInput) := Mux(
@@ -243,7 +265,8 @@ class ComputeArray(p: BiRaParams) extends Module {
       p.dim.U,
       operandCount
     )
-    io.columnSums(column) := tree.io.output
+    narrowColumnSums(column) := tree.io.output
+    io.columnSums(column) := tree.io.output.pad(p.accumulatorBits)
     if (column == 0) {
       io.outputValid := tree.io.outputValid
     }
@@ -252,17 +275,18 @@ class ComputeArray(p: BiRaParams) extends Module {
   // Final-layer mode changes the meaning of columns: every active column owns
   // one input channel instead of one output channel. The normal per-column
   // trees still form W16 products; this tree performs the extra Cin reduction.
-  private val columnTree = Module(new AddTree(p.accumulatorBits))
+  private val columnTree = Module(new AddTree(p.columnReduceBits))
   for (column <- 0 until 16) {
     columnTree.io.inputs(column) :=
-      (if (column < p.dim) io.columnSums(column)
-       else 0.S(p.accumulatorBits.W))
+      (if (column < p.dim)
+         narrowColumnSums(column).pad(p.columnReduceBits)
+       else 0.S(p.columnReduceBits.W))
   }
   columnTree.io.inputValid :=
     io.input.bits.columnReduceMode && io.outputValid
   columnTree.io.inputCount := (p.dim / 2).U
   io.columnReducedValid := columnTree.io.outputValid
-  io.columnReducedSum := columnTree.io.output
+  io.columnReducedSum := columnTree.io.output.pad(p.accumulatorBits)
 
   when(io.input.valid && !io.input.bits.binaryMode) {
     assert(

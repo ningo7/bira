@@ -6,9 +6,9 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
 /** Tests the Rocket-independent ISA decoder and Context lifecycle. */
-class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
+class CmdFrontendSpec extends AnyFreeSpec with Matchers {
   "frontend must build a Context, track inflight work, fence, status, and flush" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 16,
       fullBanks = 4,
       binaryBanks = 4,
@@ -21,7 +21,7 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
       nContexts = 4
     )
 
-    simulate(new BiRaCmdFrontend(p)) { dut =>
+    simulate(new CmdFrontend(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.command.valid.poke(false.B)
       dut.io.response.ready.poke(false.B)
@@ -31,7 +31,7 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
       dut.io.completion.valid.poke(false.B)
       dut.io.tlbFlush.ready.poke(true.B)
       dut.io.tlbFlushDone.valid.poke(false.B)
-      dut.io.tlbFlushDone.bits.poke(BiRaError.none.U)
+      dut.io.tlbFlushDone.bits.poke(ErrorCode.none.U)
       dut.io.schedulerStatus.loadQueueCount.poke(0.U)
       dut.io.schedulerStatus.execQueueCount.poke(0.U)
       dut.io.schedulerStatus.storeQueueCount.poke(0.U)
@@ -78,48 +78,51 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
           (BigInt(3) << 28) |
           (BigInt(1) << 32) |
           (BigInt(1) << 36)
-      driveCommand(BiRaFunct.cfgShape, shapeRs1, shapeRs2)
+      driveCommand(Funct.cfgShape, shapeRs1, shapeRs2)
 
       def configureAddress(role: Int, baseRow: Int): Unit = {
         val packed =
           BigInt(contextId) |
             (BigInt(role) << 3) |
             (BigInt(baseRow) << 7)
-        driveCommand(BiRaFunct.cfgAddr, packed, 0)
+        driveCommand(Funct.cfgAddr, packed, 0)
       }
 
-      configureAddress(BiRaAddrRole.input, 0)
-      configureAddress(BiRaAddrRole.weightLow, 64)
-      configureAddress(BiRaAddrRole.weightHigh, 128)
-      configureAddress(BiRaAddrRole.parameter, 0)
-      configureAddress(BiRaAddrRole.accumulator, 0)
-      configureAddress(BiRaAddrRole.outputFull, 192)
+      configureAddress(AddrRole.input, 0)
+      configureAddress(AddrRole.weightLow, 64)
+      configureAddress(AddrRole.weightHigh, 128)
+      configureAddress(AddrRole.parameter, 0)
+      configureAddress(AddrRole.accumulator, 0)
+      configureAddress(AddrRole.outputFull, 192)
 
       val modeRs1 =
         BigInt(contextId) |
-          (BigInt(BiRaArrayMode.dense) << 3) |
-          (BigInt(BiRaWeightPrecision.w16) << 5) |
-          (BigInt(BiRaPostMode.intRelu) << 8) |
+          (BigInt(ArrayMode.dense) << 3) |
+          (BigInt(WgtPrecision.w16) << 5) |
+          (BigInt(PostMode.intRelu) << 8) |
           (BigInt(1) << 12)
-      driveCommand(BiRaFunct.cfgMode, modeRs1, 0)
-      driveCommand(BiRaFunct.cfgCommit, contextId, 0)
+      driveCommand(Funct.cfgMode, modeRs1, 0)
+      driveCommand(Funct.cfgCommit, contextId, 0)
+      while (!dut.io.command.ready.peek().litToBoolean) {
+        dut.clock.step()
+      }
 
       dut.io.contexts(contextId).ready.expect(true.B)
       dut.io.contexts(contextId).committed.expect(true.B)
-      dut.io.contexts(contextId).errorCode.expect(BiRaError.none.U)
+      dut.io.contexts(contextId).errorCode.expect(ErrorCode.none.U)
 
       val loadRows = 4
       val loadBytes = 16
       val loadDescriptor =
         BigInt(contextId) |
-          (BigInt(BiRaAddrRole.input) << 3) |
+          (BigInt(AddrRole.input) << 3) |
           (BigInt(0) << 7) |
           (BigInt(loadRows) << 21) |
           (BigInt(loadBytes) << 35) |
           (BigInt(loadBytes) << 42) |
           (BigInt(1) << 58)
 
-      dut.io.command.bits.funct.poke(BiRaFunct.load2d.U)
+      dut.io.command.bits.funct.poke(Funct.load2d.U)
       dut.io.command.bits.rs1.poke("h80001000".U)
       dut.io.command.bits.rs2.poke(loadDescriptor.U)
       dut.io.command.bits.rd.poke(0.U)
@@ -131,7 +134,7 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
       dut.io.command.ready.expect(true.B)
       dut.io.loadTask.valid.expect(true.B)
       dut.io.loadTask.bits.contextId.expect(contextId.U)
-      dut.io.loadTask.bits.role.expect(BiRaAddrRole.input.U)
+      dut.io.loadTask.bits.role.expect(AddrRole.input.U)
       dut.io.loadTask.bits.dramVirtualAddress.expect("h80001000".U)
       dut.io.loadTask.bits.rows.expect(loadRows.U)
       dut.io.loadTask.bits.bytesPerRow.expect(loadBytes.U)
@@ -147,7 +150,7 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
       // FENCE(CONTEXT) must not return before the accepted LOAD completes.
       val fenceRequest = BigInt(1) | (BigInt(contextId) << 1)
       driveCommand(
-        BiRaFunct.fence,
+        Funct.fence,
         fenceRequest,
         0,
         rd = 5,
@@ -158,7 +161,7 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
 
       dut.io.completion.bits.contextId.poke(contextId.U)
       dut.io.completion.bits.commandSequence.poke(loadSequence.U)
-      dut.io.completion.bits.errorCode.poke(BiRaError.none.U)
+      dut.io.completion.bits.errorCode.poke(ErrorCode.none.U)
       dut.io.completion.valid.poke(true.B)
       dut.clock.step()
       dut.io.completion.valid.poke(false.B)
@@ -175,7 +178,7 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
       // STATUS(CONTEXT) returns the committed/ready snapshot.
       val statusRequest = BigInt(1) | (BigInt(contextId) << 1)
       driveCommand(
-        BiRaFunct.status,
+        Funct.status,
         statusRequest,
         0,
         rd = 6,
@@ -195,7 +198,7 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
       // TLB_FLUSH is a blocking response command and delegates invalidation to
       // the future Rocket/PTW adapter.
       driveCommand(
-        BiRaFunct.tlbFlush,
+        Funct.tlbFlush,
         0,
         0,
         rd = 7,
@@ -204,18 +207,18 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
       dut.clock.step()
       dut.io.tlbFlush.valid.expect(false.B)
       // The request was accepted in the preceding cycle.
-      dut.io.tlbFlushDone.bits.poke(BiRaError.none.U)
+      dut.io.tlbFlushDone.bits.poke(ErrorCode.none.U)
       dut.io.tlbFlushDone.valid.poke(true.B)
       dut.clock.step()
       dut.io.tlbFlushDone.valid.poke(false.B)
       dut.io.response.valid.expect(true.B)
       dut.io.response.bits.rd.expect(7.U)
-      dut.io.response.bits.data.expect(BiRaError.none.U)
+      dut.io.response.bits.data.expect(ErrorCode.none.U)
     }
   }
 
   "FENCE on an unimplemented Context must return an error instead of waiting" in {
-    val p = BiRaParams(
+    val p = AccelParams(
       dim = 4,
       fullBanks = 3,
       binaryBanks = 1,
@@ -228,7 +231,7 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
       nContexts = 4
     )
 
-    simulate(new BiRaCmdFrontend(p)) { dut =>
+    simulate(new CmdFrontend(p)) { dut =>
       dut.reset.poke(true.B)
       dut.io.command.valid.poke(false.B)
       dut.io.response.ready.poke(false.B)
@@ -250,7 +253,7 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
 
       val invalidContext = 7
       val request = BigInt(1) | (BigInt(invalidContext) << 1)
-      dut.io.command.bits.funct.poke(BiRaFunct.fence.U)
+      dut.io.command.bits.funct.poke(Funct.fence.U)
       dut.io.command.bits.rs1.poke(request.U)
       dut.io.command.bits.rs2.poke(0.U)
       dut.io.command.bits.rd.poke(3.U)
@@ -268,7 +271,7 @@ class BiRaCmdFrontendSpec extends AnyFreeSpec with Matchers {
       dut.io.response.bits.rd.expect(3.U)
       val result = dut.io.response.bits.data.peek().litValue
       (result & 1) mustBe 0
-      ((result >> 1) & 0xff) mustBe BiRaError.invalidContext
+      ((result >> 1) & 0xff) mustBe ErrorCode.invalidContext
       ((result >> 9) & 0x7) mustBe invalidContext
     }
   }

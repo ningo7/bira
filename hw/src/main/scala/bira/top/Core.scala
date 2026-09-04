@@ -13,23 +13,23 @@ import _root_.circt.stage.ChiselStage
   * the future ISA frontend can retain this boundary and replace the temporary
   * host-facing Decoupled ports with decoded RoCC commands and DMA traffic.
   */
-class BiRaCore(p: BiRaParams = BiRaParams()) extends Module {
+class Core(p: AccelParams = AccelParams()) extends Module {
   val io = IO(new Bundle {
     val command = Flipped(Decoupled(new ConvolutionCommand(p)))
     val binaryCommand =
       Flipped(Decoupled(new BinaryConvolutionCommand(p)))
     val parameterWrite =
-      Flipped(Decoupled(new ConvolutionParameterWrite(p)))
+      Flipped(Decoupled(new ConvParamWrite(p)))
     val binaryParameterWrite =
-      Flipped(Decoupled(new BinaryConvolutionParameterWrite(p)))
+      Flipped(Decoupled(new BinParamWrite(p)))
     val accumulatorWrite =
-      Flipped(Decoupled(new AccumulatorProgrammingWrite(p)))
+      Flipped(Decoupled(new AccProgWrite(p)))
     val accumulatorReadRequest =
       Flipped(Decoupled(UInt(p.accumulatorAddressBits.W)))
     val accumulatorReadResponse =
       Valid(Vec(p.dim, SInt(p.accumulatorBits.W)))
     val correctionReadRequest =
-      Decoupled(new BiRaCorrectionReadRequest(p))
+      Decoupled(new CorrectionReq(p))
     val correctionReadResponse =
       Flipped(Decoupled(UInt(512.W)))
     val status = Output(new AcceleratorStatus)
@@ -68,7 +68,7 @@ class BiRaCore(p: BiRaParams = BiRaParams()) extends Module {
       rowsPerBank = p.bankRows,
       lanes = p.dim,
       elementBits = p.activationBits,
-      readPorts = 5
+      readPorts = 6
     )
   )
   private val binSpad = Module(
@@ -115,7 +115,7 @@ class BiRaCore(p: BiRaParams = BiRaParams()) extends Module {
   private val binPostParamRegs = Reg(
     Vec(
       p.maxOutputBlocks,
-      Vec(p.dim, new BinaryPostProcessParameters(p))
+      Vec(p.dim, new BinPostParams(p))
     )
   )
   private val binSignThreshRegs = Reg(
@@ -131,6 +131,22 @@ class BiRaCore(p: BiRaParams = BiRaParams()) extends Module {
     accProgPending || accReadPending
   private val ctrlBusy =
     convCtrl.io.status.busy || binCtrl.io.status.busy
+  private val Seq(accOwnerIdle, accOwnerMulti, accOwnerBinary) = Enum(3)
+  private val accumulatorOwner = RegInit(accOwnerIdle)
+
+  // Controller ownership changes only at command boundaries.  Use this local
+  // register for the shared Accumulator mux so one controller's ready cone
+  // cannot propagate through the other controller's live busy/state logic.
+  when(io.command.fire) {
+    accumulatorOwner := accOwnerMulti
+  }.elsewhen(io.binaryCommand.fire) {
+    accumulatorOwner := accOwnerBinary
+  }.elsewhen(
+    (accumulatorOwner === accOwnerMulti && convCtrl.io.status.done) ||
+      (accumulatorOwner === accOwnerBinary && binCtrl.io.status.done)
+  ) {
+    accumulatorOwner := accOwnerIdle
+  }
 
   io.parameterWrite.ready :=
     !ctrlBusy &&
@@ -239,29 +255,18 @@ class BiRaCore(p: BiRaParams = BiRaParams()) extends Module {
     convFetch.io.wgtHiRdReq
   convFetch.io.wgtHiRdResp <>
     fullSpad.io.readResponse(2)
-  fullSpad.io.readRequest(3).valid := Mux(
-    binCtrl.io.status.busy,
-    binCtrl.io.resReadReq.valid,
-    bilinear.io.readRequest.valid
-  )
-  fullSpad.io.readRequest(3).bits := Mux(
-    binCtrl.io.status.busy,
-    binCtrl.io.resReadReq.bits,
-    bilinear.io.readRequest.bits
-  )
-  binCtrl.io.resReadReq.ready :=
-    fullSpad.io.readRequest(3).ready &&
-      binCtrl.io.status.busy
-  bilinear.io.readRequest.ready :=
-    fullSpad.io.readRequest(3).ready &&
-      convCtrl.io.status.busy &&
-      !binCtrl.io.status.busy
+  // Keep binary residual and bilinear traffic on distinct logical ports.
+  // They remain mutually exclusive at command level, but separating them
+  // prevents one client's address decoder from entering the other client's
+  // ready/state-enable timing cone.
+  fullSpad.io.readRequest(3) <> binCtrl.io.resReadReq
   binCtrl.io.resReadResp :=
     fullSpad.io.readResponse(3)
+  fullSpad.io.readRequest(4) <> bilinear.io.readRequest
   bilinear.io.readResponse :=
-    fullSpad.io.readResponse(3)
-  fullSpad.io.readRequest(4) <> io.fullReadRequest
-  io.fullReadResponse := fullSpad.io.readResponse(4)
+    fullSpad.io.readResponse(4)
+  fullSpad.io.readRequest(5) <> io.fullReadRequest
+  io.fullReadResponse := fullSpad.io.readResponse(5)
 
   private val fullWrArb = Module(
     new Arbiter(
@@ -292,14 +297,14 @@ class BiRaCore(p: BiRaParams = BiRaParams()) extends Module {
   io.accumulatorReadResponse.valid := false.B
   io.accumulatorReadResponse.bits := accum.io.response.bits.data
 
-  when(binCtrl.io.status.busy) {
+  when(accumulatorOwner === accOwnerBinary) {
     accum.io.request.valid :=
       binCtrl.io.accReq.valid
     accum.io.request.bits :=
       binCtrl.io.accReq.bits
     binCtrl.io.accReq.ready :=
       accum.io.request.ready
-  }.elsewhen(convCtrl.io.status.busy) {
+  }.elsewhen(accumulatorOwner === accOwnerMulti) {
     accum.io.request.valid :=
       convCtrl.io.accReq.valid
     accum.io.request.bits :=
@@ -350,19 +355,19 @@ class BiRaCore(p: BiRaParams = BiRaParams()) extends Module {
 
   convCtrl.io.accResp.valid :=
     accum.io.response.valid &&
-      convCtrl.io.status.busy
+      accumulatorOwner === accOwnerMulti
   convCtrl.io.accResp.bits :=
     accum.io.response.bits
   binCtrl.io.accResp.valid :=
     accum.io.response.valid &&
-      binCtrl.io.status.busy
+      accumulatorOwner === accOwnerBinary
   binCtrl.io.accResp.bits :=
     accum.io.response.bits
   accum.io.response.ready := Mux(
-    binCtrl.io.status.busy,
+    accumulatorOwner === accOwnerBinary,
     binCtrl.io.accResp.ready,
     Mux(
-      convCtrl.io.status.busy,
+      accumulatorOwner === accOwnerMulti,
       convCtrl.io.accResp.ready,
       hostAccPending
     )
@@ -385,7 +390,7 @@ class BiRaCore(p: BiRaParams = BiRaParams()) extends Module {
   }
 
   arrayDispatch.io.binaryMode :=
-    binCtrl.io.status.busy
+    accumulatorOwner === accOwnerBinary
   arrayDispatch.io.multiInputValid :=
     convCtrl.io.arrayInValid
   arrayDispatch.io.multiActivationBits :=
@@ -478,11 +483,11 @@ class BiRaCore(p: BiRaParams = BiRaParams()) extends Module {
 }
 
 /** Generate a standalone SystemVerilog top for inspection and synthesis. */
-object GenBiRaCore extends App {
+object GenCore extends App {
   private val targetDir =
     args.headOption.getOrElse("build/generated-rtl")
   ChiselStage.emitSystemVerilogFile(
-    new BiRaCore(),
+    new Core(),
     args = Array("--target-dir", targetDir),
     firtoolOpts = Array(
       "-disable-all-randomization",

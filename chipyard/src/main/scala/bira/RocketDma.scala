@@ -14,8 +14,8 @@ import freechips.rocketchip.tilelink._
   * Source 0 is reserved for reads and source 1 for writes. Each bridge has at
   * most one request outstanding, while LOAD and STORE may proceed in parallel.
   */
-class BiRaTileLinkDma(
-  biraParams: BiRaParams
+class TileLinkDma(
+  cfg: AccelParams
 )(implicit parameters: Parameters)
     extends LazyModule {
   val node = TLClientNode(
@@ -32,32 +32,32 @@ class BiRaTileLinkDma(
   )
 
   override lazy val module =
-    new BiRaTileLinkDmaModule(this, biraParams)
+    new TileLinkDmaImp(this, cfg)
 }
 
-class BiRaTileLinkDmaModule(
-  outer: BiRaTileLinkDma,
-  biraParams: BiRaParams
+class TileLinkDmaImp(
+  outer: TileLinkDma,
+  cfg: AccelParams
 )(implicit parameters: Parameters)
     extends LazyModuleImp(outer) {
     val io = IO(new Bundle {
       val readRequest =
-        Flipped(Decoupled(new BiRaPhysicalReadRequest))
+        Flipped(Decoupled(new PhysReadReq))
       val readResponse =
-        Decoupled(new BiRaPhysicalReadResponse(biraParams))
+        Decoupled(new PhysReadResp(cfg))
       val writeRequest =
         Flipped(
-          Decoupled(new BiRaPhysicalWriteRequest(biraParams))
+          Decoupled(new PhysWriteReq(cfg))
         )
       val writeResponse =
-        Decoupled(new BiRaPhysicalWriteResponse)
+        Decoupled(new PhysWriteResp)
     })
 
     private val (tl, edge) = outer.node.out.head
     private val beatBytes = edge.manager.beatBytes
     require(
-      beatBytes == biraParams.dmaBeatBytes,
-      s"BIRA dmaBeatBytes=${biraParams.dmaBeatBytes} must equal TileLink beatBytes=$beatBytes"
+      beatBytes == cfg.dmaBeatBytes,
+      s"BIRA dmaBeatBytes=${cfg.dmaBeatBytes} must equal TileLink beatBytes=$beatBytes"
     )
     private val lgBeatBytes = log2Ceil(beatBytes)
 
@@ -91,11 +91,11 @@ class BiRaTileLinkDmaModule(
     io.readResponse.valid := tl.d.valid && responseIsRead
     io.readResponse.bits.data := tl.d.bits.data
     io.readResponse.bits.errorCode :=
-      Mux(responseFailed, BiRaError.access.U, BiRaError.none.U)
+      Mux(responseFailed, ErrorCode.access.U, ErrorCode.none.U)
 
     io.writeResponse.valid := tl.d.valid && responseIsWrite
     io.writeResponse.bits.errorCode :=
-      Mux(responseFailed, BiRaError.access.U, BiRaError.none.U)
+      Mux(responseFailed, ErrorCode.access.U, ErrorCode.none.U)
 
     tl.d.ready := Mux(
       responseIsRead,
@@ -119,11 +119,11 @@ class BiRaTileLinkDmaModule(
 
 /** Adapter from BIRA's stable translation protocol to one Rocket private TLB.
   *
-  * Translation status encoding carried by BiRaDmaTask:
+  * Translation status encoding carried by DmaTask:
   *   [1:0] dprv, [2] dv, [3] debug, [4] sum, [5] mxr.
   */
-class BiRaRocketTlbAdapter(
-  biraParams: BiRaParams,
+class RocketTlb(
+  cfg: AccelParams,
   entries: Int = 4
 )(implicit edge: TLEdgeOut, parameters: Parameters)
     extends CoreModule
@@ -132,8 +132,8 @@ class BiRaRocketTlbAdapter(
 
   val io = IO(new Bundle {
     val request =
-      Flipped(Decoupled(new BiRaTranslationRequest))
-    val response = Decoupled(new BiRaTranslationResponse)
+      Flipped(Decoupled(new TranslationReq))
+    val response = Decoupled(new TranslationResp)
     val ptw = new TLBPTWIO
     val flush = Input(Bool())
     val flushDone = Output(Bool())
@@ -142,14 +142,14 @@ class BiRaRocketTlbAdapter(
   private val tlb = Module(
     new TLB(
       instruction = false,
-      lgMaxSize = log2Ceil(biraParams.dmaBeatBytes),
+      lgMaxSize = log2Ceil(cfg.dmaBeatBytes),
       cfg = TLBConfig(nSets = 1, nWays = entries)
     )
   )
   private val idle :: lookup :: respond :: Nil = Enum(3)
   private val state = RegInit(idle)
-  private val requestReg = Reg(new BiRaTranslationRequest)
-  private val responseReg = Reg(new BiRaTranslationResponse)
+  private val requestReg = Reg(new TranslationReq)
+  private val responseReg = Reg(new TranslationResp)
 
   io.request.ready := state === idle && !io.flush
   when(io.request.fire) {
@@ -158,12 +158,12 @@ class BiRaRocketTlbAdapter(
   }
 
   private val alignedVirtualAddress = Cat(
-    requestReg.virtualAddress(63, biraParams.dmaBeatOffsetBits),
-    0.U(biraParams.dmaBeatOffsetBits.W)
+    requestReg.virtualAddress(63, cfg.dmaBeatOffsetBits),
+    0.U(cfg.dmaBeatOffsetBits.W)
   )
   private val originalBeatOffset =
     requestReg.virtualAddress(
-      biraParams.dmaBeatOffsetBits - 1,
+      cfg.dmaBeatOffsetBits - 1,
       0
     )
 
@@ -171,7 +171,7 @@ class BiRaRocketTlbAdapter(
   tlb.io.req.bits.vaddr :=
     alignedVirtualAddress(vaddrBitsExtended - 1, 0)
   tlb.io.req.bits.passthrough := false.B
-  tlb.io.req.bits.size := log2Ceil(biraParams.dmaBeatBytes).U
+  tlb.io.req.bits.size := log2Ceil(cfg.dmaBeatBytes).U
   tlb.io.req.bits.cmd :=
     Mux(requestReg.isWrite, M_XWR, M_XRD)
   tlb.io.req.bits.prv := requestReg.translationStatus(1, 0)
@@ -211,8 +211,8 @@ class BiRaRocketTlbAdapter(
       tlb.io.resp.paddr.pad(64) + originalBeatOffset
     responseReg.errorCode := Mux(
       pageFault,
-      BiRaError.tlb.U,
-      Mux(accessFault, BiRaError.access.U, BiRaError.none.U)
+      ErrorCode.tlb.U,
+      Mux(accessFault, ErrorCode.access.U, ErrorCode.none.U)
     )
     state := respond
   }

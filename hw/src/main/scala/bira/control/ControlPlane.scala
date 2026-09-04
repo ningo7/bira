@@ -12,31 +12,31 @@ import _root_.circt.stage.ChiselStage
   * LoadCtrl/ExecCtrl/StoreCtrl modules attach to the three issue/completion
   * pairs; a LazyRoCC wrapper attaches to command/response and TLB flush.
   */
-class BiRaControlPlane(p: BiRaParams = BiRaParams()) extends Module {
+class ControlPlane(p: AccelParams = AccelParams()) extends Module {
   val io = IO(new Bundle {
-    val command = Flipped(Decoupled(new BiRaRawCommand))
-    val response = Decoupled(new BiRaRawResponse)
+    val command = Flipped(Decoupled(new RawCmd))
+    val response = Decoupled(new RawResp)
 
-    val loadIssue = Decoupled(new BiRaDmaTask(p))
-    val execIssue = Decoupled(new BiRaExecTask(p))
-    val storeIssue = Decoupled(new BiRaDmaTask(p))
+    val loadIssue = Decoupled(new DmaTask(p))
+    val execIssue = Decoupled(new ExecTask(p))
+    val storeIssue = Decoupled(new DmaTask(p))
 
     val loadCompletion =
-      Flipped(Decoupled(new BiRaTaskCompletion(p)))
+      Flipped(Decoupled(new Completion(p)))
     val execCompletion =
-      Flipped(Decoupled(new BiRaTaskCompletion(p)))
+      Flipped(Decoupled(new Completion(p)))
     val storeCompletion =
-      Flipped(Decoupled(new BiRaTaskCompletion(p)))
+      Flipped(Decoupled(new Completion(p)))
 
-    val tlbFlush = Decoupled(new BiRaTlbFlushRequest)
+    val tlbFlush = Decoupled(new FlushReq)
     val tlbFlushDone = Flipped(Valid(UInt(8.W)))
 
-    val contexts = Output(Vec(p.nContexts, new BiRaContext(p)))
-    val status = Output(new BiRaSchedulerStatus)
+    val contexts = Output(Vec(p.nContexts, new Context(p)))
+    val status = Output(new SchedStatus)
   })
 
-  private val frontend = Module(new BiRaCmdFrontend(p))
-  private val scheduler = Module(new BiRaScheduler(p))
+  private val frontend = Module(new CmdFrontend(p))
+  private val scheduler = Module(new Scheduler(p))
 
   frontend.io.command <> io.command
   io.response <> frontend.io.response
@@ -63,11 +63,11 @@ class BiRaControlPlane(p: BiRaParams = BiRaParams()) extends Module {
 }
 
 /** Generate the Rocket-independent command frontend and scheduler top. */
-object GenBiRaControlPlane extends App {
+object GenControlPlane extends App {
   private val targetDir =
     args.headOption.getOrElse("build/generated-rtl")
   ChiselStage.emitSystemVerilogFile(
-    new BiRaControlPlane(),
+    new ControlPlane(),
     args = Array("--target-dir", targetDir),
     firtoolOpts = Array(
       "-disable-all-randomization",

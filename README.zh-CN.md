@@ -46,7 +46,7 @@ BIRA 借鉴了 Gemmini 的 RoCC 接入方式、Decoupled Access/Execute 思想�
 - 使用 current/prefetched 双权重缓冲隐藏 tile 切换时的权重读取延迟；
 - 由软件在相邻层之间安排 SPAD bank 乒乓。
 
-独立顶层 `BiRaStandaloneTop` 使用简单的存储接口，适合模块验证、trace 回放和加速器内部周期分析；Chipyard 形态则加入 Rocket、私有 TLB/PTW 和 TileLink DMA，用于裸机程序及完整系统验证。
+独立顶层 `StandaloneTop` 使用简单的存储接口，适合模块验证、trace 回放和加速器内部周期分析；Chipyard 形态则加入 Rocket、私有 TLB/PTW 和 TileLink DMA，用于裸机程序及完整系统验证。
 
 ## 二值—整数计算阵列
 
@@ -188,14 +188,14 @@ Runtime 提供两种后端：RoCC Driver 在 Chipyard 中执行真实 RV64 指�
 
 ## 测试验证
 
-BIRA 采用软件单元测试、ChiselTest、独立 Verilator 和 Chipyard Verilator 的分层验证流程。当前记录的 BFSRCNN x4 测试以 32×32 灰度图为输入、128×128 图像为输出，完整 14 层推理在独立 RTL 与 Chipyard 中均通过 16,384 B golden 输出校验。
+BIRA 采用软件单元测试、ChiselTest、独立 Verilator 和 Chipyard Verilator 的分层验证流程。当前记录的 BFSRCNN x4 测试以 32×32 灰度图为输入、128×128 图像为输出。优化后的独立 RTL 已通过 16,384 B golden 输出校验；当前版本的 Chipyard 端到端性能尚待重新实测。
 
 | 结果 | 数值 |
 |---|---:|
-| 独立 BIRA RTL，14 层有效推理 | 6,527,697 周期 |
-| Chipyard 完整 `bfsrcnn_infer()` | 6,851,654 周期 |
-| 按 200 MHz 换算的 Chipyard 单帧延迟 | 34.258 ms |
-| 按 200 MHz 换算的理论帧率 | 29.19 FPS |
+| 最近一次实测的优化后独立 BIRA RTL，14 层有效推理 | 4,602,938 周期 |
+| 按 200 MHz 换算的独立 RTL 单帧延迟 | 23.015 ms |
+| 按 200 MHz 换算的独立 RTL 理论帧率 | 43.45 FPS |
+| 当前版本 Chipyard `bfsrcnn_infer()` | 待重新实测 |
 
 ## 快速开始
 
@@ -226,7 +226,7 @@ make bfsrcnn-verilator
 
 ```bash
 cd generators/bira/hw
-sbt "runMain bira.GenBiRaStandaloneTop build/generated-rtl"
+sbt "runMain bira.GenStandaloneTop build/generated-rtl"
 ```
 
 ## 仓库布局

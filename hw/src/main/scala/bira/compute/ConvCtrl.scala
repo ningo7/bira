@@ -6,21 +6,25 @@ import chisel3._
 import chisel3.util._
 
 /** Completed convolution row waiting for post-processing and writeback. */
-class ConvCompletion(p: BiRaParams) extends Bundle {
+class ConvCompletion(p: AccelParams) extends Bundle {
   val block = UInt(p.blockIndexBits.W)
   val pixel = UInt(p.pixelIndexBits.W)
+  val outputX = UInt(p.imageDimensionBits.W)
+  val outputY = UInt(p.imageDimensionBits.W)
   val accumulator =
     Vec(p.dim, SInt(p.accumulatorBits.W))
 }
 
 /** One decoupled Accumulator transaction produced by the array pipeline. */
-class ConvAccumulatorTask(p: BiRaParams) extends Bundle {
+class ConvAccumulatorTask(p: AccelParams) extends Bundle {
   val readOnly = Bool()
   val address = UInt(p.accumulatorAddressBits.W)
   val data = Vec(p.dim, SInt(p.accumulatorBits.W))
   val completesOutput = Bool()
   val block = UInt(p.blockIndexBits.W)
   val pixel = UInt(p.pixelIndexBits.W)
+  val outputX = UInt(p.imageDimensionBits.W)
+  val outputY = UInt(p.imageDimensionBits.W)
 }
 
 /** Runtime-configured stride-one convolution controller.
@@ -41,7 +45,7 @@ class ConvAccumulatorTask(p: BiRaParams) extends Bundle {
   * input-channel group width is derived from the 16 weight bit-cells in each
   * array column: W16/W8/W4/W2 process 1/2/4/8 channels at once.
   */
-class ConvCtrl(p: BiRaParams) extends Module {
+class ConvCtrl(p: AccelParams) extends Module {
   val io = IO(new Bundle {
     val command = Flipped(Decoupled(new ConvolutionCommand(p)))
     val status = Output(new AcceleratorStatus)
@@ -69,7 +73,7 @@ class ConvCtrl(p: BiRaParams) extends Module {
       Flipped(Decoupled(new WeightFetchResponse(p)))
 
     val interpolationReq =
-      Decoupled(new BilinearInterpolationRequest(p))
+      Decoupled(new InterpReq(p))
     val interpolationResp =
       Flipped(Decoupled(Vec(p.dim, UInt(p.activationBits.W))))
 
@@ -122,7 +126,7 @@ class ConvCtrl(p: BiRaParams) extends Module {
     waitForInitialize,
     issueWeightFetch,
     waitForWeightFetch,
-    activatePrefetchedWeights,
+    usePrefetchedWeights,
     processPixel,
     issueActivationFetch,
     waitForActivationFetch,
@@ -135,8 +139,8 @@ class ConvCtrl(p: BiRaParams) extends Module {
 
   private val Seq(
     postIdle,
-    postIssueResidualInterpolation,
-    postWaitForResidualInterpolation,
+    postIssueResidual,
+    postWaitResidual,
     postIssueProcess,
     postWaitForProcess,
     postEnqueueOutput
@@ -144,13 +148,15 @@ class ConvCtrl(p: BiRaParams) extends Module {
 
   private val state = RegInit(idle)
   private val postState = RegInit(postIdle)
-  private val accIdle :: accIssue :: accWait :: Nil = Enum(3)
-  private val accState = RegInit(accIdle)
   private val commandRegister =
     RegInit(0.U.asTypeOf(new ConvolutionCommand(p)))
   private val block = RegInit(0.U(p.blockIndexBits.W))
   private val pixel = RegInit(0.U(p.pixelIndexBits.W))
   private val kernelTap = RegInit(0.U(p.kernelIndexBits.W))
+  private val outputX = RegInit(0.U(p.imageDimensionBits.W))
+  private val outputY = RegInit(0.U(p.imageDimensionBits.W))
+  private val kernelX = RegInit(0.U(p.kernelDimensionBits.W))
+  private val kernelY = RegInit(0.U(p.kernelDimensionBits.W))
   private val inputGroup = RegInit(0.U(p.channelCountBits.W))
   private val weightOperand =
     RegInit(0.U(p.weightOperandIndexBits.W))
@@ -165,6 +171,35 @@ class ConvCtrl(p: BiRaParams) extends Module {
     Reg(Vec(p.maxWeightOperands, UInt(p.activationBits.W)))
   private val fetchedActivationRow =
     Reg(Vec(p.dim, UInt(p.activationBits.W)))
+  private val spatialIndexBits = p.pixelIndexBits + 2
+  private val denseLinearBits =
+    p.fullAddressBits + p.laneIndexBits + 2
+  private val spatialIndexRegister = Reg(SInt(spatialIndexBits.W))
+  private val denseLinearBaseRegister = Reg(SInt(denseLinearBits.W))
+  private val depthwiseAddressRegister =
+    Reg(SInt((p.fullAddressBits + 2).W))
+  private val activationAddressRegister = Reg(UInt(p.fullAddressBits.W))
+  private val activationLaneRegister = Reg(UInt(p.laneIndexBits.W))
+  private val inputGroupChannelBase = RegInit(0.U(p.channelCountBits.W))
+  // Kernel-tap origins advance incrementally.  This removes the two cascaded
+  // multipliers previously used each time a tile began.
+  private val kernelSpatialStart = Reg(SInt(spatialIndexBits.W))
+  private val kernelDenseStart = Reg(SInt(denseLinearBits.W))
+  private val kernelDepthwiseStart =
+    Reg(SInt((p.fullAddressBits + 2).W))
+  private val initialSpatialStart = Reg(SInt(spatialIndexBits.W))
+  private val initialDenseStart = Reg(SInt(denseLinearBits.W))
+  private val initialDepthwiseStart =
+    Reg(SInt((p.fullAddressBits + 2).W))
+  private val spatialTapRowAdvance = Reg(SInt(spatialIndexBits.W))
+  private val denseTapRowAdvance = Reg(SInt(denseLinearBits.W))
+  private val depthwiseTapRowAdvance =
+    Reg(SInt((p.fullAddressBits + 2).W))
+  private val scanConfigPending = RegInit(false.B)
+  private val spatialRowAdvance = Reg(SInt(spatialIndexBits.W))
+  private val denseRowAdvance = Reg(SInt(denseLinearBits.W))
+  private val depthwiseRowAdvance =
+    Reg(SInt((p.fullAddressBits + 2).W))
   private val stationaryWeights =
     Reg(Vec(p.maxWeightOperands, Vec(p.dim, UInt(p.weightBits.W))))
   private val prefetchedWeights =
@@ -177,22 +212,55 @@ class ConvCtrl(p: BiRaParams) extends Module {
   private val preloadInputGroup = RegInit(0.U(p.channelCountBits.W))
   private val preloadOperand =
     RegInit(0.U(p.weightOperandIndexBits.W))
+  // Weight rows are consumed in flattened tile order.  Keep the current and
+  // prefetched tile bases as running offsets instead of rebuilding the
+  // block/kernel/group products on every request.
+  private val weightLowOffsetRegister =
+    RegInit(0.U(p.fullAddressBits.W))
+  private val weightHighOffsetRegister =
+    RegInit(0.U(p.fullAddressBits.W))
+  private val preloadWeightLowOffsetRegister =
+    RegInit(0.U(p.fullAddressBits.W))
+  private val preloadWeightHighOffsetRegister =
+    RegInit(0.U(p.fullAddressBits.W))
   private val postAccumulator =
     Reg(Vec(p.dim, SInt(p.accumulatorBits.W)))
   private val postBlock = RegInit(0.U(p.blockIndexBits.W))
   private val postPixel = RegInit(0.U(p.pixelIndexBits.W))
+  private val postOutputX = RegInit(0.U(p.imageDimensionBits.W))
+  private val postOutputY = RegInit(0.U(p.imageDimensionBits.W))
+  private val nextCompletionOutputX = RegInit(0.U(p.imageDimensionBits.W))
+  private val nextCompletionOutputY = RegInit(0.U(p.imageDimensionBits.W))
+  private val postNormalOffsetRegister = Reg(UInt(p.fullAddressBits.W))
+  private val nextPostNormalOffset = Reg(UInt(p.fullAddressBits.W))
+  private val postBinaryOffsetRegister = Reg(UInt(p.binaryAddressBits.W))
+  private val nextPostBinaryOffset = Reg(UInt(p.binaryAddressBits.W))
   private val groupPartialSum =
     Reg(Vec(p.dim, SInt(p.accumulatorBits.W)))
   private val completedPostOutput =
     Reg(Vec(p.dim, SInt(p.accumulatorBits.W)))
   private val residualRow =
     Reg(Vec(p.dim, UInt(p.activationBits.W)))
-  private val completionQueue =
-    Module(new Queue(new ConvCompletion(p), entries = 4))
-  private val accumulatorTaskQueue =
-    Module(new Queue(new ConvAccumulatorTask(p), entries = 8))
-  private val activeAccumulatorTask =
-    Reg(new ConvAccumulatorTask(p))
+  // Registered occupancy terminates ready propagation across SPAD,
+  // Accumulator, and the controller state.  Two slots still support one
+  // simultaneous enqueue/dequeue per cycle in the normal streaming case.
+  private val completionQueue = Module(
+    new Queue(
+      new ConvCompletion(p),
+      entries = 2,
+      pipe = false,
+      flow = false
+    )
+  )
+  private val accumulatorTaskQueue = Module(
+    new Queue(
+      new ConvAccumulatorTask(p),
+      entries = 2,
+      pipe = false,
+      flow = false
+    )
+  )
+  private val accumulatorOutstanding = RegInit(0.U(2.W))
   private val outputBufferValid = RegInit(false.B)
   private val outputFullPending = RegInit(false.B)
   private val outputBinaryPending = RegInit(false.B)
@@ -205,37 +273,23 @@ class ConvCtrl(p: BiRaParams) extends Module {
     RegInit(0.U(p.weightFetchCountBits.W))
   private val donePulse = RegInit(false.B)
 
-  private val operandsPerCycle = MuxLookup(
-    commandRegister.weightPrecision,
-    0.U(p.weightOperandCountBits.W)
-  )(
-    Seq(
-      16.U -> 1.U,
-      8.U -> 2.U,
-      4.U -> 4.U,
-      2.U -> 8.U
-    )
-  )
-  private val denseInputGroupCount = MuxLookup(
-      commandRegister.weightPrecision,
-      0.U(p.channelCountBits.W)
-    )(
-      Seq(
-        16.U -> commandRegister.inputChannels,
-        8.U -> ((commandRegister.inputChannels + 1.U) >> 1),
-        4.U -> ((commandRegister.inputChannels + 3.U) >> 2),
-        2.U -> ((commandRegister.inputChannels + 7.U) >> 3)
-      )
-    )
-  private val inputGroupCount = Mux(
-    commandRegister.depthwise || commandRegister.columnReduce,
-    1.U,
-    denseInputGroupCount
-  )
+  // Decode precision-dependent loop bounds once when the command is accepted.
+  // Keeping these values registered prevents weightPrecision from feeding the
+  // inner-loop address multipliers and shared-memory ready cones.
+  private val operandsPerCycle =
+    RegInit(1.U(p.weightOperandCountBits.W))
+  private val inputGroupCount =
+    RegInit(1.U(p.channelCountBits.W))
+  private val fullPrecision = RegInit(false.B)
+  // Command-shape products are invariant for the whole operation.  Register
+  // them at command acceptance so command fields do not drive the inner-loop
+  // control and address cones.
   private val runtimeKernelElements =
-    commandRegister.kernelHeight * commandRegister.kernelWidth
+    RegInit(1.U((2 * p.kernelDimensionBits).W))
   private val outputPixelCount =
-    commandRegister.outputHeight * commandRegister.outputWidth
+    // A count must represent maxPixels itself, while pixelIndexBits only
+    // needs to represent indices through maxPixels - 1.
+    RegInit(1.U((p.pixelIndexBits + 1).W))
   private val accumulatorRowCount = Mux(
     commandRegister.columnReduce,
     (outputPixelCount + (p.dim - 1).U) >> p.laneIndexBits,
@@ -256,10 +310,6 @@ class ConvCtrl(p: BiRaParams) extends Module {
   private val isLastActivationOperand =
     activationOperand === operandsPerCycle - 1.U
 
-  private val outputY = pixel / commandRegister.outputWidth
-  private val outputX = pixel % commandRegister.outputWidth
-  private val kernelY = kernelTap / commandRegister.kernelWidth
-  private val kernelX = kernelTap % commandRegister.kernelWidth
   private val signedInputY =
     outputY.zext + kernelY.zext - commandRegister.paddingY.zext
   private val signedInputX =
@@ -271,43 +321,12 @@ class ConvCtrl(p: BiRaParams) extends Module {
       signedInputX >= commandRegister.inputWidth.zext
 
   private val activeInputChannel =
-    inputGroup * operandsPerCycle + activationOperand
-  private val inputSpatialIndex =
-    signedInputY.asUInt * commandRegister.inputWidth +
-      signedInputX.asUInt
-  private val inputLinearIndex =
-    inputSpatialIndex * commandRegister.inputChannels +
-      activeInputChannel
-  private val inputVectorOffset =
-    inputLinearIndex >> p.laneIndexBits
-  private val inputLane =
-    inputLinearIndex(p.laneIndexBits - 1, 0)
+    inputGroupChannelBase + activationOperand
   private val depthwiseInputAddress =
-    commandRegister.inputBase +
-      inputSpatialIndex * commandRegister.outputBlocks + block
+    depthwiseAddressRegister.asUInt(p.fullAddressBits - 1, 0)
   private val reducedInputAddress =
-    commandRegister.inputBase + (inputSpatialIndex >> 1)
+    commandRegister.inputBase + (spatialIndexRegister.asUInt >> 1)
 
-  private val weightTileIndex =
-    (block * runtimeKernelElements + kernelTap) *
-      inputGroupCount + inputGroup
-  private val lowPrecisionWeightOffset =
-    weightTileIndex * operandsPerCycle + weightOperand
-  private val weightLowOffset = Mux(
-    commandRegister.weightPrecision === 16.U,
-    weightTileIndex,
-    lowPrecisionWeightOffset
-  )
-  private val preloadTileIndex =
-    (preloadBlock * runtimeKernelElements + preloadKernelTap) *
-      inputGroupCount + preloadInputGroup
-  private val preloadLowPrecisionWeightOffset =
-    preloadTileIndex * operandsPerCycle + preloadOperand
-  private val preloadWeightLowOffset = Mux(
-    commandRegister.weightPrecision === 16.U,
-    preloadTileIndex,
-    preloadLowPrecisionWeightOffset
-  )
   private val accumulatorAddress =
     commandRegister.accumulatorBase +
       Mux(
@@ -323,10 +342,6 @@ class ConvCtrl(p: BiRaParams) extends Module {
     )
   private val shuffledWidth =
     commandRegister.outputWidth * shuffleScale
-  private val postOutputY =
-    postPixel / commandRegister.outputWidth
-  private val postOutputX =
-    postPixel % commandRegister.outputWidth
   private val postShuffleSubPixel0 = postBlock << 1
   private val postShuffleSubY =
     postShuffleSubPixel0 >> commandRegister.shuffleLog2
@@ -339,7 +354,7 @@ class ConvCtrl(p: BiRaParams) extends Module {
   private val postShuffledPixel0 =
     postShuffledY * shuffledWidth + postShuffledX
   private val postNormalOutputOffset =
-    postPixel * commandRegister.outputBlocks + postBlock
+    postNormalOffsetRegister
   private val postFullOutputOffset = Mux(
     commandRegister.columnReduce,
     postPixel >> p.laneIndexBits,
@@ -350,11 +365,52 @@ class ConvCtrl(p: BiRaParams) extends Module {
     )
   )
 
+  /** Load the first activation address of the current kernel/input tile.
+    * The multiplications occur only at the tile boundary; the live pixel path
+    * below advances these registers with adders.
+    */
+  private def loadActivationScanStart(): Unit = {
+    spatialIndexRegister := kernelSpatialStart
+    denseLinearBaseRegister := kernelDenseStart
+    depthwiseAddressRegister := kernelDepthwiseStart
+  }
+
+  /** Prepare an activation request before entering issueActivationFetch.
+    * The request state then presents only registered address and lane signals
+    * to ConvFetch and the shared SPAD arbiter.
+    */
+  private def prepareActivationFetch(operand: UInt): Unit = {
+    val channel = inputGroupChannelBase + operand
+    val linearIndex =
+      (denseLinearBaseRegister + channel.zext).asUInt
+    activationAddressRegister := Mux(
+      commandRegister.columnReduce,
+      reducedInputAddress,
+      Mux(
+        commandRegister.depthwise,
+        depthwiseInputAddress,
+        commandRegister.inputBase +
+          (linearIndex >> p.laneIndexBits)
+      )
+    )
+    activationLaneRegister := Mux(
+      commandRegister.depthwise,
+      0.U,
+      linearIndex(p.laneIndexBits - 1, 0)
+    )
+  }
+
   /** Start filling the inactive weight buffer with the next global tile. */
-  private def armNextTilePreload(): Unit = {
+  private def armNextTilePreload(
+    currentLowOffset: UInt,
+    currentHighOffset: UInt
+  ): Unit = {
     preloadOperand := 0.U
     preloadWaiting := false.B
     preloadValid := false.B
+    preloadWeightLowOffsetRegister :=
+      currentLowOffset + Mux(fullPrecision, 1.U, operandsPerCycle)
+    preloadWeightHighOffsetRegister := currentHighOffset + 1.U
     when(!isLastInputGroup) {
       preloadBlock := block
       preloadKernelTap := kernelTap
@@ -378,28 +434,72 @@ class ConvCtrl(p: BiRaParams) extends Module {
   private def advanceAfterPixel(): Unit = {
     when(isLastPixel) {
       pixel := 0.U
+      outputX := 0.U
+      outputY := 0.U
       weightOperand := 0.U
       when(isLastInputGroup) {
         inputGroup := 0.U
+        inputGroupChannelBase := 0.U
         when(isLastKernelTap) {
           state := issueAccumulatorRead
         }.otherwise {
           kernelTap := kernelTap + 1.U
-          state := activatePrefetchedWeights
+          when(kernelX === commandRegister.kernelWidth - 1.U) {
+            kernelX := 0.U
+            kernelY := kernelY + 1.U
+            kernelSpatialStart :=
+              kernelSpatialStart + spatialTapRowAdvance
+            kernelDenseStart := kernelDenseStart + denseTapRowAdvance
+            kernelDepthwiseStart :=
+              kernelDepthwiseStart + depthwiseTapRowAdvance
+          }.otherwise {
+            kernelX := kernelX + 1.U
+            kernelSpatialStart := kernelSpatialStart + 1.S
+            kernelDenseStart :=
+              kernelDenseStart + commandRegister.inputChannels.zext
+            kernelDepthwiseStart :=
+              kernelDepthwiseStart + commandRegister.outputBlocks.zext
+          }
+          state := usePrefetchedWeights
         }
       }.otherwise {
         inputGroup := inputGroup + 1.U
-        state := activatePrefetchedWeights
+        inputGroupChannelBase :=
+          inputGroupChannelBase + operandsPerCycle
+        state := usePrefetchedWeights
       }
     }.otherwise {
       pixel := pixel + 1.U
+      spatialIndexRegister := Mux(
+        outputX === commandRegister.outputWidth - 1.U,
+        spatialIndexRegister + spatialRowAdvance,
+        spatialIndexRegister + 1.S
+      )
+      denseLinearBaseRegister := Mux(
+        outputX === commandRegister.outputWidth - 1.U,
+        denseLinearBaseRegister + denseRowAdvance,
+        denseLinearBaseRegister + commandRegister.inputChannels.zext
+      )
+      depthwiseAddressRegister := Mux(
+        outputX === commandRegister.outputWidth - 1.U,
+        depthwiseAddressRegister + depthwiseRowAdvance,
+        depthwiseAddressRegister + commandRegister.outputBlocks.zext
+      )
+      when(outputX === commandRegister.outputWidth - 1.U) {
+        outputX := 0.U
+        outputY := outputY + 1.U
+      }.otherwise {
+        outputX := outputX + 1.U
+      }
       state := processPixel
     }
   }
 
-  private def advanceAfterQueuedAccumulator(): Unit = {
+  private def advanceAfterAcc(): Unit = {
     when(isLastPixel && isLastKernelTap && isLastInputGroup) {
       pixel := 0.U
+      outputX := 0.U
+      outputY := 0.U
       state := waitForOutputDrain
     }.otherwise {
       advanceAfterPixel()
@@ -416,7 +516,9 @@ class ConvCtrl(p: BiRaParams) extends Module {
       )
       state := issueArrayCompute
     }.otherwise {
-      activationOperand := activationOperand + 1.U
+      val nextOperand = activationOperand + 1.U
+      activationOperand := nextOperand
+      prepareActivationFetch(nextOperand)
       state := issueActivationFetch
     }
   }
@@ -438,8 +540,25 @@ class ConvCtrl(p: BiRaParams) extends Module {
       block := block + 1.U
       pixel := 0.U
       kernelTap := 0.U
+      outputX := 0.U
+      outputY := 0.U
+      kernelX := 0.U
+      kernelY := 0.U
+      postOutputX := 0.U
+      postOutputY := 0.U
+      nextCompletionOutputX := 0.U
+      nextCompletionOutputY := 0.U
+      postNormalOffsetRegister := block + 1.U
+      nextPostNormalOffset := block + 1.U
+      postBinaryOffsetRegister := block + 1.U
+      nextPostBinaryOffset := block + 1.U
       inputGroup := 0.U
+      inputGroupChannelBase := 0.U
       weightOperand := 0.U
+      kernelSpatialStart := initialSpatialStart
+      kernelDenseStart := initialDenseStart
+      kernelDepthwiseStart :=
+        initialDepthwiseStart + (block + 1.U).zext
       state := initializeAccumulator
     }
   }
@@ -452,7 +571,7 @@ class ConvCtrl(p: BiRaParams) extends Module {
       !outputBufferValid
   io.status.busy :=
     state =/= idle ||
-      accState =/= accIdle ||
+      accumulatorOutstanding =/= 0.U ||
       accumulatorTaskQueue.io.deq.valid ||
       postState =/= postIdle ||
       completionQueue.io.deq.valid ||
@@ -460,8 +579,8 @@ class ConvCtrl(p: BiRaParams) extends Module {
   io.status.done := donePulse
 
   io.actFetchReq.valid := false.B
-  io.actFetchReq.bits :=
-    0.U.asTypeOf(new ActivationFetchRequest(p))
+  io.actFetchReq.bits.address := activationAddressRegister
+  io.actFetchReq.bits.lane := activationLaneRegister
   io.actFetchResp.ready := state === waitForActivationFetch
 
   io.wgtFetchReq.valid := false.B
@@ -472,9 +591,9 @@ class ConvCtrl(p: BiRaParams) extends Module {
 
   io.interpolationReq.valid := false.B
   io.interpolationReq.bits :=
-    0.U.asTypeOf(new BilinearInterpolationRequest(p))
+    0.U.asTypeOf(new InterpReq(p))
   io.interpolationResp.ready :=
-    postState === postWaitForResidualInterpolation
+    postState === postWaitResidual
 
   io.accReq.valid := false.B
   io.accReq.bits :=
@@ -543,13 +662,33 @@ class ConvCtrl(p: BiRaParams) extends Module {
     }
   }
 
+  // The command-start products are deliberately split across two cycles.
+  // Accumulator initialization provides many cycles before the first tile
+  // consumes these values, so this adds no execution bubble.
+  when(scanConfigPending) {
+    val denseOrigin =
+      initialSpatialStart * commandRegister.inputChannels.zext
+    val depthwiseOrigin =
+      commandRegister.inputBase.zext +
+        initialSpatialStart * commandRegister.outputBlocks.zext
+    initialDenseStart := denseOrigin
+    initialDepthwiseStart := depthwiseOrigin
+    kernelDenseStart := denseOrigin
+    kernelDepthwiseStart := depthwiseOrigin
+    denseTapRowAdvance :=
+      spatialTapRowAdvance * commandRegister.inputChannels.zext
+    depthwiseTapRowAdvance :=
+      spatialTapRowAdvance * commandRegister.outputBlocks.zext
+    scanConfigPending := false.B
+  }
+
   for (operand <- 0 until p.maxWeightOperands) {
     for (lane <- 0 until p.dim) {
       val reducedActivation =
         if (lane < p.dim / 2) {
           operand.U === 0.U &&
             Mux(
-              inputSpatialIndex(0),
+              spatialIndexRegister.asUInt(0),
               fetchedActivationRow(lane + p.dim / 2)(
                 activationBitIndex
               ),
@@ -593,31 +732,30 @@ class ConvCtrl(p: BiRaParams) extends Module {
     arrayResultVector(accumulatorLane) :=
       io.arrayReducedSum
   }
+  private val accumulatedArrayResult =
+    Wire(Vec(p.dim, SInt(p.accumulatorBits.W)))
+  for (lane <- 0 until p.dim) {
+    val signedPartial = Mux(
+      commandRegister.inputSigned &&
+        arrayResultBitIndex === commandRegister.activationPrecision - 1.U,
+      -arrayResultVector(lane),
+      arrayResultVector(lane)
+    )
+    val shiftedWide = signedPartial << arrayResultBitIndex
+    val shifted = shiftedWide(p.accumulatorBits - 1, 0).asSInt
+    accumulatedArrayResult(lane) := Mux(
+      arrayResultBitIndex === 0.U,
+      shifted,
+      (groupPartialSum(lane) + shifted)(p.accumulatorBits - 1, 0).asSInt
+    )
+  }
   when(
     arrayResultValid &&
       (state === issueArrayCompute ||
         state === waitForArrayResult)
   ) {
     for (lane <- 0 until p.dim) {
-      val signedPartial = Mux(
-        commandRegister.inputSigned &&
-          arrayResultBitIndex ===
-            commandRegister.activationPrecision - 1.U,
-        -arrayResultVector(lane),
-        arrayResultVector(lane)
-      )
-      val shiftedWide =
-        signedPartial << arrayResultBitIndex
-      val shifted =
-        shiftedWide(p.accumulatorBits - 1, 0).asSInt
-      groupPartialSum(lane) := Mux(
-        arrayResultBitIndex === 0.U,
-        shifted,
-        (groupPartialSum(lane) + shifted)(
-          p.accumulatorBits - 1,
-          0
-        ).asSInt
-      )
+      groupPartialSum(lane) := accumulatedArrayResult(lane)
     }
     when(
       arrayResultBitIndex ===
@@ -640,11 +778,13 @@ class ConvCtrl(p: BiRaParams) extends Module {
   ) {
     io.wgtFetchReq.valid := true.B
     io.wgtFetchReq.bits.lowAddress :=
-      commandRegister.weightLowBase + preloadWeightLowOffset
+      commandRegister.weightLowBase +
+        preloadWeightLowOffsetRegister + preloadOperand
     io.wgtFetchReq.bits.highAddress :=
-      commandRegister.weightHighBase + preloadTileIndex
+      commandRegister.weightHighBase +
+        preloadWeightHighOffsetRegister
     io.wgtFetchReq.bits.highBytePresent :=
-      commandRegister.weightPrecision === 16.U
+      fullPrecision
     when(io.wgtFetchReq.fire) {
       preloadWaiting := true.B
       weightFetchCount := weightFetchCount + 1.U
@@ -663,63 +803,55 @@ class ConvCtrl(p: BiRaParams) extends Module {
     }
   }
 
-  // Array work is queued independently from the single ordered Accumulator
-  // port. The main controller can fetch and reduce the next pixel while this
-  // engine commits the preceding pixel. Final responses feed the post queue
-  // directly without returning to the compute state machine.
-  switch(accState) {
-    is(accIdle) {
-      when(accumulatorTaskQueue.io.deq.valid) {
-        accumulatorTaskQueue.io.deq.ready := true.B
-        activeAccumulatorTask :=
-          accumulatorTaskQueue.io.deq.bits
-        accState := accIssue
-      }
-    }
+  // Carry completion metadata through VecAccum itself. This allows multiple
+  // independent requests to be in flight without a controller-side tag FIFO.
+  private val taskPortActive =
+    state =/= initializeAccumulator && state =/= waitForInitialize
+  when(taskPortActive) {
+    io.accReq.valid := accumulatorTaskQueue.io.deq.valid
+    io.accReq.bits.operation := Mux(
+      accumulatorTaskQueue.io.deq.bits.readOnly,
+      AccumulatorOperation.read,
+      AccumulatorOperation.add
+    )
+    io.accReq.bits.address := accumulatorTaskQueue.io.deq.bits.address
+    io.accReq.bits.data := accumulatorTaskQueue.io.deq.bits.data
+    io.accReq.bits.shift := 0.U
+    io.accReq.bits.negate := false.B
+    io.accReq.bits.completesOutput :=
+      accumulatorTaskQueue.io.deq.bits.completesOutput
+    io.accReq.bits.block := accumulatorTaskQueue.io.deq.bits.block
+    io.accReq.bits.pixel := accumulatorTaskQueue.io.deq.bits.pixel
+    io.accReq.bits.outputX := accumulatorTaskQueue.io.deq.bits.outputX
+    io.accReq.bits.outputY := accumulatorTaskQueue.io.deq.bits.outputY
+    accumulatorTaskQueue.io.deq.ready := io.accReq.ready
 
-    is(accIssue) {
-      io.accReq.valid := true.B
-      io.accReq.bits.operation := Mux(
-        activeAccumulatorTask.readOnly,
-        AccumulatorOperation.read,
-        AccumulatorOperation.add
-      )
-      io.accReq.bits.address :=
-        activeAccumulatorTask.address
-      io.accReq.bits.data :=
-        activeAccumulatorTask.data
-      io.accReq.bits.shift := 0.U
-      io.accReq.bits.negate := false.B
-      when(io.accReq.fire) {
-        accState := accWait
-      }
-    }
+    completionQueue.io.enq.valid :=
+      io.accResp.valid && io.accResp.bits.completesOutput
+    completionQueue.io.enq.bits.block := io.accResp.bits.block
+    completionQueue.io.enq.bits.pixel := io.accResp.bits.pixel
+    completionQueue.io.enq.bits.outputX := io.accResp.bits.outputX
+    completionQueue.io.enq.bits.outputY := io.accResp.bits.outputY
+    completionQueue.io.enq.bits.accumulator := io.accResp.bits.data
+    io.accResp.ready := Mux(
+      io.accResp.bits.completesOutput,
+      completionQueue.io.enq.ready,
+      true.B
+    )
+  }
 
-    is(accWait) {
-      completionQueue.io.enq.valid :=
-        io.accResp.valid &&
-          activeAccumulatorTask.completesOutput
-      completionQueue.io.enq.bits.block :=
-        activeAccumulatorTask.block
-      completionQueue.io.enq.bits.pixel :=
-        activeAccumulatorTask.pixel
-      completionQueue.io.enq.bits.accumulator :=
-        io.accResp.bits.data
-      io.accResp.ready := Mux(
-        activeAccumulatorTask.completesOutput,
-        completionQueue.io.enq.ready,
-        true.B
-      )
-      when(io.accResp.fire) {
-        accState := accIdle
-      }
-    }
+  private val accumulatorTaskIssued =
+    taskPortActive && accumulatorTaskQueue.io.deq.fire
+  private val accumulatorTaskCompleted =
+    taskPortActive && io.accResp.fire
+  switch(Cat(accumulatorTaskIssued, accumulatorTaskCompleted)) {
+    is("b10".U) { accumulatorOutstanding := accumulatorOutstanding + 1.U }
+    is("b01".U) { accumulatorOutstanding := accumulatorOutstanding - 1.U }
   }
 
   // Completion processing is independent of the convolution state machine.
-  // The compute side may continue producing later pixels until this queue
-  // fills, while this side performs interpolation, post-processing, and SPAD
-  // writeback in program order.
+  // The elastic boundary preserves in-order transfer while this side performs
+  // interpolation, post-processing, and SPAD writeback.
   switch(postState) {
     is(postIdle) {
       when(completionQueue.io.deq.valid) {
@@ -728,18 +860,26 @@ class ConvCtrl(p: BiRaParams) extends Module {
           completionQueue.io.deq.bits.accumulator
         postBlock := completionQueue.io.deq.bits.block
         postPixel := completionQueue.io.deq.bits.pixel
+        postOutputX := completionQueue.io.deq.bits.outputX
+        postOutputY := completionQueue.io.deq.bits.outputY
+        postNormalOffsetRegister := nextPostNormalOffset
+        nextPostNormalOffset :=
+          nextPostNormalOffset + commandRegister.outputBlocks
+        postBinaryOffsetRegister := nextPostBinaryOffset
+        nextPostBinaryOffset :=
+          nextPostBinaryOffset + commandRegister.outputBlocks
         residualRow :=
           VecInit.fill(p.dim)(0.U(p.activationBits.W))
         postState := Mux(
           commandRegister.columnReduce &&
             commandRegister.bilinearResidual,
-          postIssueResidualInterpolation,
+          postIssueResidual,
           postIssueProcess
         )
       }
     }
 
-    is(postIssueResidualInterpolation) {
+    is(postIssueResidual) {
       io.interpolationReq.valid := true.B
       io.interpolationReq.bits.inputBase :=
         commandRegister.residualBase
@@ -753,16 +893,18 @@ class ConvCtrl(p: BiRaParams) extends Module {
         commandRegister.outputWidth
       io.interpolationReq.bits.outputStartPixel :=
         (postPixel >> p.laneIndexBits) << p.laneIndexBits
+      io.interpolationReq.bits.outputStartX := postOutputX
+      io.interpolationReq.bits.outputStartY := postOutputY
       io.interpolationReq.bits.outputPixelCount :=
         outputPixelCount
       io.interpolationReq.bits.scaleLog2 :=
         commandRegister.shuffleLog2
       when(io.interpolationReq.fire) {
-        postState := postWaitForResidualInterpolation
+        postState := postWaitResidual
       }
     }
 
-    is(postWaitForResidualInterpolation) {
+    is(postWaitResidual) {
       when(io.interpolationResp.fire) {
         residualRow := io.interpolationResp.bits
         postState := postIssueProcess
@@ -788,8 +930,7 @@ class ConvCtrl(p: BiRaParams) extends Module {
         outputFullAddress :=
           commandRegister.outputBase + postFullOutputOffset
         outputBinaryAddress :=
-          commandRegister.binaryOutputBase +
-            postPixel * commandRegister.outputBlocks + postBlock
+          commandRegister.binaryOutputBase + postBinaryOffsetRegister
         for (lane <- 0 until p.dim) {
           val finalSum =
             completedPostOutput(lane).pad(p.accumulatorBits + 1) +
@@ -838,7 +979,7 @@ class ConvCtrl(p: BiRaParams) extends Module {
     val configuredOutputPixels =
       io.command.bits.outputHeight *
         io.command.bits.outputWidth
-    val configuredAccumulatorRows = Mux(
+    val cfgAccRows = Mux(
       io.command.bits.columnReduce,
       (configuredOutputPixels + (p.dim - 1).U) >>
         p.laneIndexBits,
@@ -859,7 +1000,7 @@ class ConvCtrl(p: BiRaParams) extends Module {
     assert(io.command.bits.outputBlocks <= p.maxOutputBlocks.U)
     assert(
       io.command.bits.accumulatorBase +&
-        configuredAccumulatorRows <=
+        cfgAccRows <=
         p.accumulatorRows.U,
       "configured output does not fit in accumulator storage"
     )
@@ -959,10 +1100,72 @@ class ConvCtrl(p: BiRaParams) extends Module {
     }
 
     commandRegister := io.command.bits
+    val cfgInitialSpatial =
+      -(io.command.bits.paddingY.zext *
+        io.command.bits.inputWidth.zext +
+        io.command.bits.paddingX.zext)
+    val cfgTapRowAdvance =
+      io.command.bits.inputWidth.zext -
+        io.command.bits.kernelWidth.zext + 1.S
+    initialSpatialStart := cfgInitialSpatial
+    kernelSpatialStart := cfgInitialSpatial
+    spatialTapRowAdvance := cfgTapRowAdvance
+    scanConfigPending := true.B
+    runtimeKernelElements :=
+      io.command.bits.kernelHeight * io.command.bits.kernelWidth
+    outputPixelCount := configuredOutputPixels
+    operandsPerCycle := MuxLookup(
+      io.command.bits.weightPrecision,
+      1.U(p.weightOperandCountBits.W)
+    )(
+      Seq(
+        16.U -> 1.U,
+        8.U -> 2.U,
+        4.U -> 4.U,
+        2.U -> 8.U
+      )
+    )
+    inputGroupCount := Mux(
+      io.command.bits.depthwise || io.command.bits.columnReduce,
+      1.U,
+      MuxLookup(
+        io.command.bits.weightPrecision,
+        1.U(p.channelCountBits.W)
+      )(
+        Seq(
+          16.U -> io.command.bits.inputChannels,
+          8.U -> ((io.command.bits.inputChannels + 1.U) >> 1),
+          4.U -> ((io.command.bits.inputChannels + 3.U) >> 2),
+          2.U -> ((io.command.bits.inputChannels + 7.U) >> 3)
+        )
+      )
+    )
+    fullPrecision := io.command.bits.weightPrecision === 16.U
+    val cfgRowAdvance =
+      io.command.bits.inputWidth.zext -
+        io.command.bits.outputWidth.zext + 1.S
+    spatialRowAdvance := cfgRowAdvance
+    denseRowAdvance :=
+      cfgRowAdvance * io.command.bits.inputChannels.zext
+    depthwiseRowAdvance :=
+      cfgRowAdvance * io.command.bits.outputBlocks.zext
     block := 0.U
     pixel := 0.U
     kernelTap := 0.U
+    outputX := 0.U
+    outputY := 0.U
+    kernelX := 0.U
+    kernelY := 0.U
+    postOutputX := 0.U
+    postOutputY := 0.U
+    nextCompletionOutputX := 0.U
+    nextCompletionOutputY := 0.U
+    postNormalOffsetRegister := 0.U
+    nextPostNormalOffset := 0.U
+    postBinaryOffsetRegister := 0.U
+    nextPostBinaryOffset := 0.U
     inputGroup := 0.U
+    inputGroupChannelBase := 0.U
     weightOperand := 0.U
     preloadActive := false.B
     preloadWaiting := false.B
@@ -971,6 +1174,10 @@ class ConvCtrl(p: BiRaParams) extends Module {
     preloadKernelTap := 0.U
     preloadInputGroup := 0.U
     preloadOperand := 0.U
+    weightLowOffsetRegister := 0.U
+    weightHighOffsetRegister := 0.U
+    preloadWeightLowOffsetRegister := 0.U
+    preloadWeightHighOffsetRegister := 0.U
     activationOperand := 0.U
     activationBitIndex := 0.U
     arrayResultBitIndex := 0.U
@@ -1014,12 +1221,16 @@ class ConvCtrl(p: BiRaParams) extends Module {
         when(pixel === accumulatorRowCount - 1.U) {
           pixel := 0.U
           kernelTap := 0.U
+          outputX := 0.U
+          outputY := 0.U
+          kernelX := 0.U
+          kernelY := 0.U
           inputGroup := 0.U
           weightOperand := 0.U
           state := Mux(
             block === 0.U,
             issueWeightFetch,
-            activatePrefetchedWeights
+            usePrefetchedWeights
           )
         }.otherwise {
           pixel := pixel + 1.U
@@ -1031,11 +1242,12 @@ class ConvCtrl(p: BiRaParams) extends Module {
     is(issueWeightFetch) {
       io.wgtFetchReq.valid := true.B
       io.wgtFetchReq.bits.lowAddress :=
-        commandRegister.weightLowBase + weightLowOffset
+        commandRegister.weightLowBase +
+          weightLowOffsetRegister + weightOperand
       io.wgtFetchReq.bits.highAddress :=
-        commandRegister.weightHighBase + weightTileIndex
+        commandRegister.weightHighBase + weightHighOffsetRegister
       io.wgtFetchReq.bits.highBytePresent :=
-        commandRegister.weightPrecision === 16.U
+        fullPrecision
       when(io.wgtFetchReq.fire) {
         weightFetchCount := weightFetchCount + 1.U
         state := waitForWeightFetch
@@ -1048,7 +1260,13 @@ class ConvCtrl(p: BiRaParams) extends Module {
           io.wgtFetchResp.bits.weights
         when(isLastWeightOperand) {
           pixel := 0.U
-          armNextTilePreload()
+          outputX := 0.U
+          outputY := 0.U
+          loadActivationScanStart()
+          armNextTilePreload(
+            weightLowOffsetRegister,
+            weightHighOffsetRegister
+          )
           state := processPixel
         }.otherwise {
           weightOperand := weightOperand + 1.U
@@ -1057,15 +1275,23 @@ class ConvCtrl(p: BiRaParams) extends Module {
       }
     }
 
-    is(activatePrefetchedWeights) {
+    is(usePrefetchedWeights) {
       when(preloadValid) {
         assert(preloadBlock === block)
         assert(preloadKernelTap === kernelTap)
         assert(preloadInputGroup === inputGroup)
         stationaryWeights := prefetchedWeights
         preloadValid := false.B
-        armNextTilePreload()
+        weightLowOffsetRegister := preloadWeightLowOffsetRegister
+        weightHighOffsetRegister := preloadWeightHighOffsetRegister
+        armNextTilePreload(
+          preloadWeightLowOffsetRegister,
+          preloadWeightHighOffsetRegister
+        )
         pixel := 0.U
+        outputX := 0.U
+        outputY := 0.U
+        loadActivationScanStart()
         state := processPixel
       }
     }
@@ -1086,6 +1312,7 @@ class ConvCtrl(p: BiRaParams) extends Module {
         }
       }.otherwise {
         activationOperand := 0.U
+        prepareActivationFetch(0.U)
         state := issueActivationFetch
       }
     }
@@ -1099,17 +1326,6 @@ class ConvCtrl(p: BiRaParams) extends Module {
         advanceAfterActivation()
       }.otherwise {
         io.actFetchReq.valid := true.B
-        io.actFetchReq.bits.address := Mux(
-          commandRegister.columnReduce,
-          reducedInputAddress,
-          Mux(
-            commandRegister.depthwise,
-            depthwiseInputAddress,
-            commandRegister.inputBase + inputVectorOffset
-          )
-        )
-        io.actFetchReq.bits.lane :=
-          Mux(commandRegister.depthwise, 0.U, inputLane)
         when(io.actFetchReq.fire) {
           state := waitForActivationFetch
         }
@@ -1150,7 +1366,34 @@ class ConvCtrl(p: BiRaParams) extends Module {
     }
 
     is(waitForArrayResult) {
-      when(arrayBurstDone) {
+      val finalArrayResult =
+        arrayResultValid &&
+          arrayResultBitIndex === commandRegister.activationPrecision - 1.U
+      when(finalArrayResult) {
+        accumulatorTaskQueue.io.enq.valid := true.B
+        accumulatorTaskQueue.io.enq.bits.readOnly := false.B
+        accumulatorTaskQueue.io.enq.bits.address := accumulatorAddress
+        accumulatorTaskQueue.io.enq.bits.data := accumulatedArrayResult
+        accumulatorTaskQueue.io.enq.bits.completesOutput :=
+          isLastKernelTap &&
+            isLastInputGroup &&
+            (!commandRegister.columnReduce || isAccumulatorRowEnd)
+        accumulatorTaskQueue.io.enq.bits.block := block
+        accumulatorTaskQueue.io.enq.bits.pixel := pixel
+        accumulatorTaskQueue.io.enq.bits.outputX :=
+          nextCompletionOutputX
+        accumulatorTaskQueue.io.enq.bits.outputY :=
+          nextCompletionOutputY
+        assert(
+          accumulatorTaskQueue.io.enq.ready,
+          "multi-bit array completion must enter Accumulator without a bubble"
+        )
+        when(accumulatorTaskQueue.io.enq.fire) {
+          advanceAfterAcc()
+        }
+      }.elsewhen(arrayBurstDone) {
+        // Defensive fallback for a delayed control observation. The normal
+        // fixed-latency path consumes the last AddTree result above.
         state := issueBitAccumulate
       }
     }
@@ -1169,8 +1412,10 @@ class ConvCtrl(p: BiRaParams) extends Module {
             isAccumulatorRowEnd)
       accumulatorTaskQueue.io.enq.bits.block := block
       accumulatorTaskQueue.io.enq.bits.pixel := pixel
+      accumulatorTaskQueue.io.enq.bits.outputX := nextCompletionOutputX
+      accumulatorTaskQueue.io.enq.bits.outputY := nextCompletionOutputY
       when(accumulatorTaskQueue.io.enq.fire) {
-        advanceAfterQueuedAccumulator()
+        advanceAfterAcc()
       }
     }
 
@@ -1184,21 +1429,40 @@ class ConvCtrl(p: BiRaParams) extends Module {
       accumulatorTaskQueue.io.enq.bits.completesOutput := true.B
       accumulatorTaskQueue.io.enq.bits.block := block
       accumulatorTaskQueue.io.enq.bits.pixel := pixel
+      accumulatorTaskQueue.io.enq.bits.outputX := nextCompletionOutputX
+      accumulatorTaskQueue.io.enq.bits.outputY := nextCompletionOutputY
       when(accumulatorTaskQueue.io.enq.fire) {
-        advanceAfterQueuedAccumulator()
+        advanceAfterAcc()
       }
     }
 
     is(waitForOutputDrain) {
       when(
         !accumulatorTaskQueue.io.deq.valid &&
-          accState === accIdle &&
+          accumulatorOutstanding === 0.U &&
           !completionQueue.io.deq.valid &&
           postState === postIdle &&
           !outputBufferValid
       ) {
         finishOutputBlock()
       }
+    }
+  }
+
+  // Completion vectors are produced in raster order. Tag each one with its
+  // first output coordinate and derive the next tag from the current final
+  // pixel. This stays one compare/add stage regardless of p.dim and avoids a
+  // p.dim-deep coordinate-update chain in the post-processing path.
+  when(
+    accumulatorTaskQueue.io.enq.fire &&
+      accumulatorTaskQueue.io.enq.bits.completesOutput
+  ) {
+    when(outputX === commandRegister.outputWidth - 1.U) {
+      nextCompletionOutputX := 0.U
+      nextCompletionOutputY := outputY + 1.U
+    }.otherwise {
+      nextCompletionOutputX := outputX + 1.U
+      nextCompletionOutputY := outputY
     }
   }
 }
