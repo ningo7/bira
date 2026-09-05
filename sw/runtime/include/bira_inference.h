@@ -75,6 +75,7 @@ typedef struct {
     bira_native_blob_t weight_low;
     bira_native_blob_t weight_high;
     bira_native_blob_t parameters;
+    /* Packed per-pixel -N biases used to initialize binary Accumulator rows. */
     bira_native_blob_t correction;
 } bira_layer_desc_t;
 

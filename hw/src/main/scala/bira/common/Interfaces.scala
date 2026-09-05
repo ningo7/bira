@@ -36,6 +36,53 @@ class ElasticRegister[T <: Data](gen: T) extends Module {
   }
 }
 
+/** Two-entry non-transparent pipeline buffer implemented with registers.
+  *
+  * A generic two-entry Queue with a several-hundred-bit payload is commonly
+  * mapped to asynchronously-read distributed RAM on Xilinx FPGAs. That costs
+  * LUTs and leaves a wide memory read mux on the consumer path. These
+  * controller boundaries only need two ordered skid slots, so fixed registers
+  * are smaller and can be placed next to their producer and consumer.
+  *
+  * `enq.ready` depends only on registered occupancy, preserving the intended
+  * combinational timing cut. At occupancy one, consume-and-replace happens in
+  * one cycle, so steady-state initiation interval remains one.
+  */
+class TwoEntryBuffer[T <: Data](gen: T) extends Module {
+  val io = IO(new Bundle {
+    val enq = Flipped(Decoupled(gen))
+    val deq = Decoupled(gen)
+  })
+
+  private val occupancy = RegInit(0.U(2.W))
+  private val first = Reg(gen)
+  private val second = Reg(gen)
+
+  io.enq.ready := occupancy =/= 2.U
+  io.deq.valid := occupancy =/= 0.U
+  io.deq.bits := first
+
+  private val enqueue = io.enq.fire
+  private val dequeue = io.deq.fire
+
+  when(enqueue && dequeue) {
+    // Non-transparent full handling means this case occurs at occupancy one.
+    first := io.enq.bits
+  }.elsewhen(enqueue) {
+    when(occupancy === 0.U) {
+      first := io.enq.bits
+    }.otherwise {
+      second := io.enq.bits
+    }
+    occupancy := occupancy + 1.U
+  }.elsewhen(dequeue) {
+    when(occupancy === 2.U) {
+      first := second
+    }
+    occupancy := occupancy - 1.U
+  }
+}
+
 /** Temporary standalone command for a stride-one multi-bit convolution.
   *
   * Address units are vector rows, not bytes. A full-scratchpad row contains
@@ -106,8 +153,9 @@ class InterpReq(p: AccelParams) extends Bundle {
   * channel, kernel tap, and input block.
   *
   * `correctionBase` points at compiler-preloaded Parameter Buffer rows. Each
-  * row packs multiple per-pixel `-N` values. The accumulator starts from zero
-  * and holds `2 * popcount`; post-processing adds the selected `-N`.
+  * row packs multiple per-pixel `-N` values used as the binary convolution
+  * bias. The accumulator is initialized from that bias and then accumulates
+  * `2 * popcount`, so post-processing receives `2 * popcount - N` directly.
   */
 class BinaryConvolutionCommand(p: AccelParams) extends Bundle {
   val inputBase = UInt(p.binaryAddressBits.W)
@@ -204,11 +252,13 @@ class PostProcessParameters(p: AccelParams) extends Bundle {
   val qMax = SInt(p.accumulatorBits.W)
 }
 
-class ConvParamWrite(p: AccelParams) extends Bundle {
+/** Parameters for the two output lanes stored in one 512-bit ABI row. */
+class ConvParamPairWrite(p: AccelParams) extends Bundle {
   val block = UInt(p.blockIndexBits.W)
-  val bias = Vec(p.dim, SInt(p.accumulatorBits.W))
-  val post = Vec(p.dim, new PostProcessParameters(p))
-  val binaryThreshold = Vec(p.dim, SInt(p.accumulatorBits.W))
+  val lanePair = UInt(p.parameterLanePairBits.W)
+  val bias = Vec(2, SInt(p.accumulatorBits.W))
+  val post = Vec(2, new PostProcessParameters(p))
+  val binaryThreshold = Vec(2, SInt(p.accumulatorBits.W))
 }
 
 /** One vector row used to preload compiler-derived accumulator constants. */
@@ -249,12 +299,14 @@ class BinPostParams(p: AccelParams) extends Bundle {
   val qMax = SInt(p.accumulatorBits.W)
 }
 
-class BinParamWrite(p: AccelParams) extends Bundle {
+/** Binary parameters for the two lanes stored in one 512-bit ABI row. */
+class BinParamPairWrite(p: AccelParams) extends Bundle {
   val block = UInt(p.blockIndexBits.W)
-  val post = Vec(p.dim, new BinPostParams(p))
+  val lanePair = UInt(p.parameterLanePairBits.W)
+  val post = Vec(2, new BinPostParams(p))
   /** Threshold used to prepare the next binary layer's input. */
   val outputSignThreshold =
-    Vec(p.dim, SInt(p.accumulatorBits.W))
+    Vec(2, SInt(p.accumulatorBits.W))
 }
 
 class AcceleratorStatus extends Bundle {

@@ -59,7 +59,9 @@ typedef struct {
     bira_native_blob_t weight;
     bira_native_blob_t parameters;
     /*
-     * One signed int32 -N value per output pixel in row-major order.
+     * One signed int32 binary-convolution bias (-N) per output pixel in
+     * row-major order. Hardware initializes every output-channel lane of the
+     * corresponding Accumulator row with this value.
      * correction_row_stride_bytes is the byte stride between image rows.
      * The operator packs these scalars into native Parameter Buffer rows.
      */

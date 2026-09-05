@@ -33,11 +33,10 @@ class BinaryCompletion(p: AccelParams) extends Bundle {
   * `dim` output lanes. The tile is loaded once and remains stationary while
   * all output pixels are visited.
   *
-  * Accumulators start from zero. Each valid array result is an equality
-  * popcount accumulated with shift=1, so the completed value is
-  * `2 * popcount`. Before fused scale/RPReLU, the controller reads the
-  * compiler-programmed per-pixel `-N` from the Parameter Buffer. The
-  * post-processing input is therefore exactly `2 * popcount - N`.
+  * Accumulators start from the compiler-programmed per-pixel `-N` bias.
+  * Each valid array result is an equality popcount accumulated with shift=1,
+  * so the completed value presented to fused scale/RPReLU is already exactly
+  * `2 * popcount - N`.
   */
 class BinConvCtrl(p: AccelParams) extends Module {
   val io = IO(new Bundle {
@@ -89,7 +88,6 @@ class BinConvCtrl(p: AccelParams) extends Module {
 
     val postAcc =
       Output(Vec(p.dim, SInt(p.accumulatorBits.W)))
-    val postCorrection = Output(SInt(p.accumulatorBits.W))
     val postRes =
       Output(Vec(p.dim, SInt(p.accumulatorBits.W)))
     val postInValid = Output(Bool())
@@ -117,6 +115,8 @@ class BinConvCtrl(p: AccelParams) extends Module {
 
   private val Seq(
     idle,
+    issueInitBiasRead,
+    waitInitBiasRead,
     issueAccInit,
     waitAccInit,
     issueWeightRead,
@@ -127,8 +127,6 @@ class BinConvCtrl(p: AccelParams) extends Module {
     issueArrayCompute,
     waitForArrayResult,
     issuePopcountAccumulate,
-    issueFinalCorrectionRead,
-    waitFinalCorrectionRead,
     streamPixels,
     drainArrayStream,
     issueAccumulatorRead,
@@ -140,12 +138,10 @@ class BinConvCtrl(p: AccelParams) extends Module {
     postIdle,
     postIssueResidualRead,
     postWaitResidualRead,
-    postIssueCorrectionRead,
-    postWaitCorrectionRead,
     postIssueProcess,
     postWaitProcess,
     postEnqueueOutput
-  ) = Enum(8)
+  ) = Enum(6)
   private val postState = RegInit(postIdle)
   private val commandRegister =
     RegInit(0.U.asTypeOf(new BinaryConvolutionCommand(p)))
@@ -178,6 +174,10 @@ class BinConvCtrl(p: AccelParams) extends Module {
   private val activationRegister = Reg(UInt(p.dim.W))
   private val actAddrReg =
     Reg(UInt(p.binaryAddressBits.W))
+  // Preserve the runtime address state as a real register bank. Otherwise
+  // Vivado can absorb its narrow feedback update into a cascaded DSP
+  // accumulator together with command-time scan arithmetic.
+  dontTouch(actAddrReg)
   private val initialActivationStart =
     Reg(SInt((p.binaryAddressBits + 2).W))
   private val kernelActivationStart =
@@ -192,7 +192,10 @@ class BinConvCtrl(p: AccelParams) extends Module {
     Reg(SInt((p.binaryAddressBits + 2).W))
   private val scanConfigPending = RegInit(false.B)
   private val activationRowAdvance =
-    Reg(SInt((p.binaryAddressBits + 2).W))
+    Reg(UInt(p.binaryAddressBits.W))
+  // This is an intentional command-time/runtime pipeline boundary.
+  dontTouch(activationRowAdvance)
+  private val lastOutputX = Reg(UInt(p.imageDimensionBits.W))
   private val streamInputPixel = Reg(UInt(p.pixelIndexBits.W))
   private val streamInputPadding = RegInit(false.B)
   private val streamInputValid = RegInit(false.B)
@@ -211,7 +214,6 @@ class BinConvCtrl(p: AccelParams) extends Module {
     RegInit(0.U((p.pixelIndexBits + 1).W))
   private val finalAccumulator =
     Reg(Vec(p.dim, SInt(p.accumulatorBits.W)))
-  private val finalAccumulatorPixel = Reg(UInt(p.pixelIndexBits.W))
   private val finalResidualValid = RegInit(false.B)
   private val finalPostTagValid =
     RegInit(VecInit(Seq.fill(BinPostProc.latency)(false.B)))
@@ -252,26 +254,15 @@ class BinConvCtrl(p: AccelParams) extends Module {
   private val weightFetchCount =
     RegInit(0.U(p.weightFetchCountBits.W))
   private val donePulse = RegInit(false.B)
-  // Two entries keep the steady-state request stream at II=1 while making
-  // enq.ready depend only on registered occupancy.  A one-entry elastic
-  // register propagates Accumulator/SPAD backpressure into the coordinate
-  // state update and creates a long cross-controller combinational path.
+  // Two-slot, non-transparent timing buffers prevent downstream ready from
+  // propagating combinationally across VecAccum. They preserve steady-state
+  // II=1 but do not provide task scheduling or reordering.
   private val accumulatorTaskQueue = Module(
-    new Queue(
-      new BinaryAccumulatorTask(p),
-      entries = 2,
-      pipe = false,
-      flow = false
-    )
+    new TwoEntryBuffer(new BinaryAccumulatorTask(p))
   )
   private val accumulatorOutstanding = RegInit(0.U(2.W))
   private val completionQueue = Module(
-    new Queue(
-      new BinaryCompletion(p),
-      entries = 2,
-      pipe = false,
-      flow = false
-    )
+    new TwoEntryBuffer(new BinaryCompletion(p))
   )
 
   private val runtimeKernelElements =
@@ -280,6 +271,38 @@ class BinConvCtrl(p: AccelParams) extends Module {
     RegInit(1.U((p.pixelIndexBits + 1).W))
   private val inputBlockCount =
     RegInit(1.U(p.channelCountBits.W))
+
+  // Spell the narrow modulo address increment as a bit-level carry chain.
+  // This maps naturally to FPGA CARRY4s and prevents Vivado from folding the
+  // feedback address and command-time row-stride multiply into cascaded DSPs.
+  private def carryAdd(lhs: UInt, rhs: UInt): UInt = {
+    val width = p.binaryAddressBits
+    val sum = Wire(Vec(width, Bool()))
+    val carry = Wire(Vec(width + 1, Bool()))
+    carry(0) := false.B
+    for (bit <- 0 until width) {
+      sum(bit) := lhs(bit) ^ rhs(bit) ^ carry(bit)
+      carry(bit + 1) :=
+        (lhs(bit) && rhs(bit)) ||
+          (lhs(bit) && carry(bit)) ||
+          (rhs(bit) && carry(bit))
+    }
+    sum.asUInt
+  }
+
+  // Keep the row-end select after the two narrow adders.  Selecting the
+  // increment before the add lets Vivado absorb that mux back into the DSP
+  // which holds activationRowAdvance, putting outputX on a DSP OPMODE path.
+  private val nextRowActivationAddress =
+    carryAdd(actAddrReg, activationRowAdvance)
+  private val nextLinearActivationAddress =
+    carryAdd(actAddrReg, inputBlockCount.pad(p.binaryAddressBits))
+  private val nextActivationAddress =
+    Mux(
+      outputX === lastOutputX,
+      nextRowActivationAddress,
+      nextLinearActivationAddress
+    )
 
   private val isLastPixel = pixel === outputPixelCount - 1.U
   private val isLastKernelTap =
@@ -299,11 +322,11 @@ class BinConvCtrl(p: AccelParams) extends Module {
       signedInputX >= commandRegister.inputWidth.zext
   private val accumulatorAddress =
     commandRegister.accumulatorBase + pixel
-  private val postCorrectionAddress =
+  private val initializationBiasAddress =
     commandRegister.correctionBase +
-      (postPixel >> p.correctionEntryIndexBits)
-  private val postCorrectionEntry =
-    postPixel.pad(p.correctionEntryIndexBits)(
+      (pixel >> p.correctionEntryIndexBits)
+  private val initializationBiasEntry =
+    pixel.pad(p.correctionEntryIndexBits)(
       p.correctionEntryIndexBits - 1,
       0
     )
@@ -387,13 +410,8 @@ class BinConvCtrl(p: AccelParams) extends Module {
       }
     }.otherwise {
       pixel := pixel + 1.U
-      actAddrReg :=
-        Mux(
-          outputX === commandRegister.outputWidth - 1.U,
-          (actAddrReg.zext + activationRowAdvance).asUInt,
-          actAddrReg + inputBlockCount
-        )(p.binaryAddressBits - 1, 0)
-      when(outputX === commandRegister.outputWidth - 1.U) {
+      actAddrReg := nextActivationAddress
+      when(outputX === lastOutputX) {
         outputX := 0.U
         outputY := outputY + 1.U
       }.otherwise {
@@ -444,7 +462,10 @@ class BinConvCtrl(p: AccelParams) extends Module {
         commandRegister.fullOutputBase + block + 1.U
       nextPostBinaryAddress :=
         commandRegister.binaryOutputBase + block + 1.U
-      state := issueAccInit
+      correctionNextValid := false.B
+      correctionPrefetchValid := false.B
+      corrPrefetchPending := false.B
+      state := issueInitBiasRead
     }
   }
 
@@ -472,10 +493,9 @@ class BinConvCtrl(p: AccelParams) extends Module {
   io.resReadReq.valid := false.B
   io.resReadReq.bits := postResidualAddress
   io.correctionReadReq.valid := false.B
-  io.correctionReadReq.bits.address := postCorrectionAddress
+  io.correctionReadReq.bits.address := initializationBiasAddress
   io.correctionReadResp.ready :=
-    postState === postWaitCorrectionRead ||
-      state === waitFinalCorrectionRead ||
+    state === waitInitBiasRead ||
       corrPrefetchPending
 
   io.accReq.valid := false.B
@@ -525,22 +545,11 @@ class BinConvCtrl(p: AccelParams) extends Module {
   }
 
   io.postAcc := Mux(finalStreamActive, finalAccumulator, postAccumulator)
-  private val correctionEntries = correctionRegister.asTypeOf(
-    Vec(
-      p.correctionEntriesPerRow,
-      SInt(p.accumulatorBits.W)
-    )
-  )
-  private val finalCorrectionEntry =
-    finalAccumulatorPixel.pad(p.correctionEntryIndexBits)(
-      p.correctionEntryIndexBits - 1,
-      0
-    )
-  io.postCorrection := Mux(
-    finalStreamActive,
-    correctionEntries(finalCorrectionEntry),
-    correctionEntries(postCorrectionEntry)
-  )
+  // Correction rows are packed in pixel order. Consume the low entry and
+  // shift after each initialization write instead of building a 16:1 mux
+  // from the live pixel index into the 512-bit row.
+  private val initializationBias =
+    correctionRegister(p.accumulatorBits - 1, 0).asSInt
   io.postRes := Mux(
     finalStreamActive,
     VecInit(io.resReadResp.bits.map(_.asSInt.pad(p.accumulatorBits))),
@@ -585,12 +594,12 @@ class BinConvCtrl(p: AccelParams) extends Module {
     }
   }
 
-  // The final tile consumes one packed correction row for every 16 pixels.
-  // Fetch row zero before starting, then keep the following row in a second
-  // register so Parameter Buffer latency never appears in the pixel stream.
-  when(state === issueFinalCorrectionRead) {
+  // Treat binary correction as the Accumulator's conventional initialization
+  // bias. Fetch the first packed row before initialization and prefetch each
+  // following row while the current 16 pixels are being written.
+  when(state === issueInitBiasRead) {
     io.correctionReadReq.valid := true.B
-    io.correctionReadReq.bits.address := commandRegister.correctionBase
+    io.correctionReadReq.bits.address := initializationBiasAddress
   }.elsewhen(correctionPrefetchValid) {
     io.correctionReadReq.valid := true.B
     io.correctionReadReq.bits.address := corrPrefetchAddr
@@ -679,7 +688,9 @@ class BinConvCtrl(p: AccelParams) extends Module {
   // VecAccum returns the controller tag with each ordered response, allowing
   // independent rows to remain in flight without a task/tag FIFO pair.
   private val taskPortActive =
-    state =/= issueAccInit &&
+    state =/= issueInitBiasRead &&
+      state =/= waitInitBiasRead &&
+      state =/= issueAccInit &&
       state =/= waitAccInit
   when(taskPortActive) {
     io.accReq.valid := accumulatorTaskQueue.io.deq.valid
@@ -700,10 +711,8 @@ class BinConvCtrl(p: AccelParams) extends Module {
     io.accReq.bits.outputY := 0.U
     accumulatorTaskQueue.io.deq.ready := io.accReq.ready
 
-    // Register every completed output, including the final streaming tile.
-    // This terminates the combinational Accumulator -> residual-SPAD ready
-    // path.  The two-entry non-flow-through queue still sustains one result
-    // per cycle in steady state.
+    // Register completed outputs so residual/SPAD readiness cannot feed back
+    // into VecAccum in the same cycle.
     completionQueue.io.enq.valid :=
       io.accResp.valid && io.accResp.bits.completesOutput
     completionQueue.io.enq.bits.block := io.accResp.bits.block
@@ -730,9 +739,8 @@ class BinConvCtrl(p: AccelParams) extends Module {
       finalOutputOutstanding := finalOutputOutstanding - 1.U
     }
   }
-  // During the final tile, drain the registered completion stream directly
-  // into the synchronous residual read port.  The queue absorbs any short
-  // bank-arbitration delay without exposing it to VecAccum.
+  // During the final tile, the registered completion stage absorbs a short
+  // residual-port arbitration delay without extending the ready path.
   when(finalStreamActive && completionQueue.io.deq.valid) {
     io.resReadReq.valid := true.B
     io.resReadReq.bits := finalResidualAddress
@@ -745,39 +753,9 @@ class BinConvCtrl(p: AccelParams) extends Module {
     finalResidualAddress :=
       finalResidualAddress + commandRegister.outputBlocks
     finalAccumulator := completionQueue.io.deq.bits.accumulator
-    finalAccumulatorPixel := completionQueue.io.deq.bits.pixel
-    when(
-      completionQueue.io.deq.bits.pixel.pad(p.correctionEntryIndexBits)(
-        p.correctionEntryIndexBits - 1,
-        0
-      ) === 0.U &&
-        completionQueue.io.deq.bits.pixel +
-          p.correctionEntriesPerRow.U < outputPixelCount
-    ) {
-      corrPrefetchAddr := commandRegister.correctionBase +
-        (completionQueue.io.deq.bits.pixel >>
-          p.correctionEntryIndexBits) + 1.U
-      correctionPrefetchValid := true.B
-    }
   }
   when(finalResidualValid) {
     assert(io.resReadResp.valid, "final residual tag must align with SPAD response")
-    when(
-      finalCorrectionEntry === (p.correctionEntriesPerRow - 1).U &&
-        finalAccumulatorPixel =/= outputPixelCount - 1.U
-    ) {
-      assert(
-        correctionNextValid ||
-          (corrPrefetchPending && io.correctionReadResp.fire),
-        "next correction row must be prefetched before the pixel boundary"
-      )
-      correctionRegister := Mux(
-        correctionNextValid,
-        correctionNextRegister,
-        io.correctionReadResp.bits
-      )
-      correctionNextValid := false.B
-    }
   }
 
   finalPostTagValid(0) := finalResidualValid
@@ -854,22 +832,6 @@ class BinConvCtrl(p: AccelParams) extends Module {
               p.accumulatorBits
             )
         }
-        postState := Mux(
-          postCorrectionEntry === 0.U,
-          postIssueCorrectionRead,
-          postIssueProcess
-        )
-      }
-    }
-    is(postIssueCorrectionRead) {
-      io.correctionReadReq.valid := true.B
-      when(io.correctionReadReq.fire) {
-        postState := postWaitCorrectionRead
-      }
-    }
-    is(postWaitCorrectionRead) {
-      when(io.correctionReadResp.fire) {
-        correctionRegister := io.correctionReadResp.bits
         postState := postIssueProcess
       }
     }
@@ -919,7 +881,10 @@ class BinConvCtrl(p: AccelParams) extends Module {
       commandRegister.inputBase.zext +
         initialSpatialStart * configuredInputBlocks
     activationRowAdvance :=
-      pixelSpatialRowAdvance * configuredInputBlocks
+      (pixelSpatialRowAdvance * configuredInputBlocks).asUInt(
+        p.binaryAddressBits - 1,
+        0
+      )
     activationTapRowAdvance :=
       tapSpatialRowAdvance * configuredInputBlocks
     weightLaneStride := configuredWeightStride
@@ -996,6 +961,7 @@ class BinConvCtrl(p: AccelParams) extends Module {
     pixel := 0.U
     kernelTap := 0.U
     outputX := 0.U
+    lastOutputX := io.command.bits.outputWidth - 1.U
     outputY := 0.U
     kernelX := 0.U
     kernelY := 0.U
@@ -1017,7 +983,7 @@ class BinConvCtrl(p: AccelParams) extends Module {
     outputFullPending := false.B
     outputBinaryPending := false.B
     postState := postIdle
-    state := issueAccInit
+    state := issueInitBiasRead
     streamTagStage1Valid := false.B
     streamTagStage2Valid := false.B
     streamTagStage3Valid := false.B
@@ -1037,14 +1003,30 @@ class BinConvCtrl(p: AccelParams) extends Module {
   }
 
   switch(state) {
+    is(issueInitBiasRead) {
+      when(io.correctionReadReq.fire) {
+        state := waitInitBiasRead
+      }
+    }
+
+    is(waitInitBiasRead) {
+      when(io.correctionReadResp.fire) {
+        correctionRegister := io.correctionReadResp.bits
+        correctionNextValid := false.B
+        when(p.correctionEntriesPerRow.U < outputPixelCount) {
+          corrPrefetchAddr := commandRegister.correctionBase + 1.U
+          correctionPrefetchValid := true.B
+        }
+        state := issueAccInit
+      }
+    }
+
     is(issueAccInit) {
       io.accReq.valid := true.B
       io.accReq.bits.operation :=
         AccumulatorOperation.write
       io.accReq.bits.address := accumulatorAddress
-      io.accReq.bits.data := VecInit.fill(p.dim)(
-        0.S(p.accumulatorBits.W)
-      )
+      io.accReq.bits.data := VecInit.fill(p.dim)(initializationBias)
       when(io.accReq.fire) {
         state := waitAccInit
       }
@@ -1061,6 +1043,33 @@ class BinConvCtrl(p: AccelParams) extends Module {
           )
         }.otherwise {
           pixel := pixel + 1.U
+          when(
+            initializationBiasEntry ===
+              (p.correctionEntriesPerRow - 1).U
+          ) {
+            assert(
+              correctionNextValid ||
+                (corrPrefetchPending && io.correctionReadResp.fire),
+              "next binary bias row must be prefetched before initialization boundary"
+            )
+            correctionRegister := Mux(
+              correctionNextValid,
+              correctionNextRegister,
+              io.correctionReadResp.bits
+            )
+            correctionNextValid := false.B
+            val nextPixel = pixel + 1.U
+            when(
+              nextPixel + p.correctionEntriesPerRow.U < outputPixelCount
+            ) {
+              corrPrefetchAddr := commandRegister.correctionBase +
+                (nextPixel >> p.correctionEntryIndexBits) + 1.U
+              correctionPrefetchValid := true.B
+            }
+          }.otherwise {
+            correctionRegister :=
+              correctionRegister >> p.accumulatorBits
+          }
           state := issueAccInit
         }
       }
@@ -1080,11 +1089,13 @@ class BinConvCtrl(p: AccelParams) extends Module {
         outputX := 0.U
         outputY := 0.U
         actAddrReg := kernelActivationStart.asUInt
-        state := Mux(
-          isLastKernelTap && isLastInputBlock,
-          issueFinalCorrectionRead,
-          streamPixels
-        )
+        when(isLastKernelTap && isLastInputBlock) {
+          finalStreamActive := true.B
+          finalResidualAddress := commandRegister.residualBase + block
+          finalFullOutputAddress := commandRegister.fullOutputBase + block
+          finalBinaryOutputAddress := commandRegister.binaryOutputBase + block
+        }
+        state := streamPixels
       }.elsewhen(!preloadActive && !preloadWaiting) {
         io.wgtReadReq.valid := true.B
         when(io.wgtReadReq.fire) {
@@ -1104,11 +1115,13 @@ class BinConvCtrl(p: AccelParams) extends Module {
           outputY := 0.U
           actAddrReg := kernelActivationStart.asUInt
           armNextTilePreload(weightTileBase)
-          state := Mux(
-            isLastKernelTap && isLastInputBlock,
-            issueFinalCorrectionRead,
-            streamPixels
-          )
+          when(isLastKernelTap && isLastInputBlock) {
+            finalStreamActive := true.B
+            finalResidualAddress := commandRegister.residualBase + block
+            finalFullOutputAddress := commandRegister.fullOutputBase + block
+            finalBinaryOutputAddress := commandRegister.binaryOutputBase + block
+          }
+          state := streamPixels
         }.otherwise {
           weightLane := weightLane + 1.U
           weightReadAddress := weightReadAddress + weightLaneStride
@@ -1174,27 +1187,6 @@ class BinConvCtrl(p: AccelParams) extends Module {
       }
     }
 
-    is(issueFinalCorrectionRead) {
-      when(io.correctionReadReq.fire) {
-        state := waitFinalCorrectionRead
-      }
-    }
-
-    is(waitFinalCorrectionRead) {
-      when(io.correctionReadResp.fire) {
-        correctionRegister := io.correctionReadResp.bits
-        correctionNextValid := false.B
-        finalStreamActive := true.B
-        finalResidualAddress := commandRegister.residualBase + block
-        finalFullOutputAddress := commandRegister.fullOutputBase + block
-        finalBinaryOutputAddress := commandRegister.binaryOutputBase + block
-        pixel := 0.U
-        outputX := 0.U
-        outputY := 0.U
-        state := streamPixels
-      }
-    }
-
     is(streamPixels) {
       io.actReadReq.valid := !inputIsPadding
       when(inputIsPadding || io.actReadReq.fire) {
@@ -1207,13 +1199,8 @@ class BinConvCtrl(p: AccelParams) extends Module {
           state := drainArrayStream
         }.otherwise {
           pixel := pixel + 1.U
-          actAddrReg :=
-            Mux(
-              outputX === commandRegister.outputWidth - 1.U,
-              (actAddrReg.zext + activationRowAdvance).asUInt,
-              actAddrReg + inputBlockCount
-            )(p.binaryAddressBits - 1, 0)
-          when(outputX === commandRegister.outputWidth - 1.U) {
+          actAddrReg := nextActivationAddress
+          when(outputX === lastOutputX) {
             outputX := 0.U
             outputY := outputY + 1.U
           }.otherwise {

@@ -122,27 +122,31 @@ class Shrink1Spec extends AnyFreeSpec with Matchers {
 
       for (outputBlock <- 0 until outputBlocks) {
         dut.io.parameterWrite.bits.block.poke(outputBlock.U)
-        for (lane <- 0 until p.dim) {
-          val outputChannel = outputBlock * p.dim + lane
-          dut.io.parameterWrite.bits.bias(lane)
-            .poke(bias(outputChannel).S)
-          val post = dut.io.parameterWrite.bits.post(lane)
-          post.positiveShift.poke(requantShift(outputChannel).S)
-          post.negativeCoeff1.poke(0.S)
-          post.negativeCoeff2.poke(0.S)
-          post.negativeLeftShift1.poke(0.U)
-          post.negativeLeftShift2.poke(0.U)
-          post.negativeCommonShift.poke(0.S)
-          post.qMin.poke(0.S)
-          post.qMax.poke(255.S)
-          dut.io.parameterWrite.bits.binaryThreshold(lane).poke(0.S)
-        }
-        dut.io.parameterWrite.valid.poke(true.B)
-        while (!dut.io.parameterWrite.ready.peek().litToBoolean) {
+        for (lanePair <- 0 until p.parameterRowsPerBlock) {
+          dut.io.parameterWrite.bits.lanePair.poke(lanePair.U)
+          for (laneInRow <- 0 until 2) {
+            val lane = lanePair * 2 + laneInRow
+            val outputChannel = outputBlock * p.dim + lane
+            dut.io.parameterWrite.bits.bias(laneInRow)
+              .poke(bias(outputChannel).S)
+            val post = dut.io.parameterWrite.bits.post(laneInRow)
+            post.positiveShift.poke(requantShift(outputChannel).S)
+            post.negativeCoeff1.poke(0.S)
+            post.negativeCoeff2.poke(0.S)
+            post.negativeLeftShift1.poke(0.U)
+            post.negativeLeftShift2.poke(0.U)
+            post.negativeCommonShift.poke(0.S)
+            post.qMin.poke(0.S)
+            post.qMax.poke(255.S)
+            dut.io.parameterWrite.bits.binaryThreshold(laneInRow).poke(0.S)
+          }
+          dut.io.parameterWrite.valid.poke(true.B)
+          while (!dut.io.parameterWrite.ready.peek().litToBoolean) {
+            dut.clock.step()
+          }
           dut.clock.step()
+          dut.io.parameterWrite.valid.poke(false.B)
         }
-        dut.clock.step()
-        dut.io.parameterWrite.valid.poke(false.B)
       }
 
       dut.io.command.bits.inputBase.poke(inputBase.U)

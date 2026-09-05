@@ -9,11 +9,12 @@ import freechips.rocketchip.tilelink.TLEdgeOut
 
 /** Complete BIRA RoCC accelerator shell for Chipyard.
   *
-  * The default 8-byte DMA beat matches the standard Rocket/Chipyard system
-  * bus. All compute and ISA modules remain in the Rocket-independent hw tree.
+  * The default 16-byte DMA beat matches the 128-bit system bus selected by
+  * AccelRocketConfig. All compute and ISA modules remain in the
+  * Rocket-independent hw tree.
   */
 class RoCCAccel(
-  val cfg: AccelParams = AccelParams(dmaBeatBytes = 8),
+  val cfg: AccelParams = AccelParams(dmaBeatBytes = 16),
   opcodes: OpcodeSet = OpcodeSet.custom3
 )(implicit parameters: Parameters)
     extends LazyRoCC(opcodes = opcodes, nPTWPorts = 2) {
@@ -127,7 +128,7 @@ class RoCCAccelImp(
 
 /** Add this fragment instead of a Gemmini BuildRoCC fragment. */
 class WithRoCCAccel(
-  cfg: AccelParams = AccelParams(dmaBeatBytes = 8)
+  cfg: AccelParams = AccelParams(dmaBeatBytes = 16)
 ) extends Config((site, here, up) => {
   case BuildRoCC =>
     up(BuildRoCC) ++ Seq(

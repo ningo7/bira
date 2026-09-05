@@ -17,8 +17,8 @@ import chisel3.util._
   * live output lane; repeated border samples are intentionally not cached in
   * this first implementation.
   *
-  * The arithmetic is split across two registered stages after the reads:
-  * horizontal weighting, followed by vertical weighting/rounding.
+  * The arithmetic is split across three registered stages after the reads:
+  * horizontal weighting, vertical products, then rounding/saturation.
   */
 class BilinearInterp(p: AccelParams) extends Module {
   private val sampleCount = 4
@@ -26,6 +26,9 @@ class BilinearInterp(p: AccelParams) extends Module {
   private val sampleCountBits = log2Ceil(sampleCount + 1)
   private val laneIndexBits = log2Ceil(p.dim)
   private val sampleLinearBits = 2 * p.imageDimensionBits + 1
+  private val packedRowStrideBits =
+    (p.imageDimensionBits - laneIndexBits) max 1
+  private val partialRowBits = p.imageDimensionBits + laneIndexBits
   private val coordinateBits = p.imageDimensionBits + p.shuffleLogBits + 3
   private val denominatorBits = log2Ceil(2 * p.maxShuffleScale + 1)
   private val horizontalBits =
@@ -51,8 +54,9 @@ class BilinearInterp(p: AccelParams) extends Module {
     streamSampleReads,
     horizontalStage,
     verticalStage,
+    finishStage,
     sendResponse
-  ) = Enum(7)
+  ) = Enum(8)
 
   private val state = RegInit(idle)
   private val requestReg =
@@ -86,6 +90,8 @@ class BilinearInterp(p: AccelParams) extends Module {
   private val verticalWeight1 = Reg(UInt(denominatorBits.W))
   private val roundingBias = Reg(UInt(numeratorBits.W))
   private val resultShift = Reg(UInt((p.shuffleLogBits + 2).W))
+  private val verticalTopProduct = Reg(UInt(numeratorBits.W))
+  private val verticalBottomProduct = Reg(UInt(numeratorBits.W))
 
   private val outputIndex =
     requestReg.outputStartPixel + lane
@@ -240,28 +246,46 @@ class BilinearInterp(p: AccelParams) extends Module {
       // by either zero/one column or zero/one input row.  Registering the
       // packed row/lane here prevents coordinate arithmetic from crossing the
       // shared-SPAD arbiter and reaching a BRAM address pin in one cycle.
-      val topLeft = Wire(UInt(sampleLinearBits.W))
-      val xStep = Wire(UInt(sampleLinearBits.W))
-      val rowStep = Wire(UInt(sampleLinearBits.W))
-      val linearSamples = Wire(Vec(sampleCount, UInt(sampleLinearBits.W)))
-      topLeft :=
-        sourceY0Reg * requestReg.inputWidth + sourceX0Reg
-      xStep := sourceX1Reg - sourceX0Reg
-      rowStep := Mux(
-        sourceY1Reg === sourceY0Reg,
-        0.U,
-        requestReg.inputWidth
-      )
-      linearSamples(0) := topLeft
-      linearSamples(1) := topLeft + xStep
-      linearSamples(2) := topLeft + rowStep
-      linearSamples(3) := topLeft + rowStep + xStep
+      // For dim=16, split width into 16*q+r:
+      // floor((y*width+x)/16) = y*q + floor((y*r+x)/16).
+      // This is exact for every runtime width but replaces the former 8x8
+      // multiply and long 17-bit adder chain with two 8x4 products and short
+      // packed-row additions.
+      val paddedInputWidth =
+        requestReg.inputWidth.pad(p.imageDimensionBits + laneIndexBits)
+      val packedRowStride =
+        (paddedInputWidth >> laneIndexBits)(
+          packedRowStrideBits - 1,
+          0
+        )
+      val laneRowStride =
+        paddedInputWidth(laneIndexBits - 1, 0)
+      val topPackedRow = Wire(UInt(partialRowBits.W))
+      val bottomPackedRow = Wire(UInt(partialRowBits.W))
+      val topLaneBase = Wire(UInt(partialRowBits.W))
+      val bottomLaneBase = Wire(UInt(partialRowBits.W))
+      topPackedRow := sourceY0Reg * packedRowStride
+      bottomPackedRow := sourceY1Reg * packedRowStride
+      topLaneBase := sourceY0Reg * laneRowStride
+      bottomLaneBase := sourceY1Reg * laneRowStride
+
+      val sampleWithinRow = Wire(Vec(sampleCount, UInt(partialRowBits.W)))
+      sampleWithinRow(0) := topLaneBase + sourceX0Reg
+      sampleWithinRow(1) := topLaneBase + sourceX1Reg
+      sampleWithinRow(2) := bottomLaneBase + sourceX0Reg
+      sampleWithinRow(3) := bottomLaneBase + sourceX1Reg
       for (sample <- 0 until sampleCount) {
+        val packedRow = Mux(
+          sample.U < 2.U,
+          topPackedRow,
+          bottomPackedRow
+        )
         sampleRows(sample) :=
           requestReg.inputBase +
-            (linearSamples(sample) >> p.laneIndexBits)
+            packedRow +
+            (sampleWithinRow(sample) >> laneIndexBits)
         sampleLanes(sample) :=
-          linearSamples(sample)(laneIndexBits - 1, 0)
+          sampleWithinRow(sample)(laneIndexBits - 1, 0)
       }
       sampleIssueCount := 0.U
       state := streamSampleReads
@@ -295,10 +319,16 @@ class BilinearInterp(p: AccelParams) extends Module {
     }
 
     is(verticalStage) {
+      verticalTopProduct := horizontalTop * verticalWeight0
+      verticalBottomProduct := horizontalBottom * verticalWeight1
+      state := finishStage
+    }
+
+    is(finishStage) {
       val numerator = Wire(UInt(numeratorBits.W))
       numerator :=
-        horizontalTop * verticalWeight0 +
-          horizontalBottom * verticalWeight1 +
+        verticalTopProduct +
+          verticalBottomProduct +
           roundingBias
       val interpolated = numerator >> resultShift
       result(lane) := Mux(

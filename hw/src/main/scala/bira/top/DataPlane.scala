@@ -6,7 +6,7 @@ import chisel3._
 import chisel3.util._
 
 /** Converts one scheduled EXEC task and its Context into the existing core
-  * command, loading every output block's decoded parameters first.
+  * command, streaming every output block's two-lane parameter rows first.
   */
 class ExecBridge(p: AccelParams) extends Module {
   val io = IO(new Bundle {
@@ -15,11 +15,11 @@ class ExecBridge(p: AccelParams) extends Module {
     val parameterRequest =
       Decoupled(new ParamRead(p))
     val parameterResponse =
-      Flipped(Decoupled(new DecodedParams(p)))
+      Flipped(Decoupled(new ParamRowResponse(p)))
     val multiParameter =
-      Decoupled(new ConvParamWrite(p))
+      Decoupled(new ConvParamPairWrite(p))
     val binaryParameter =
-      Decoupled(new BinParamWrite(p))
+      Decoupled(new BinParamPairWrite(p))
     val multiCommand =
       Decoupled(new ConvolutionCommand(p))
     val binaryCommand =
@@ -31,19 +31,16 @@ class ExecBridge(p: AccelParams) extends Module {
   private val Seq(
     idle,
     requestParameter,
-    waitParameter,
-    writeParameter,
+    streamParameter,
     issueCommand,
     run,
     complete
-  ) = Enum(7)
+  ) = Enum(6)
   private val state = RegInit(idle)
   private val taskReg = Reg(new ExecTask(p))
   private val contextReg = Reg(new Context(p))
   private val block = RegInit(0.U(p.blockIndexBits.W))
   private val blocks = Reg(UInt(p.blockIndexBits.W))
-  private val decoded =
-    Reg(new DecodedParams(p))
   private val completionError = RegInit(ErrorCode.none.U(8.W))
 
   private val selectedContext = MuxLookup(
@@ -94,31 +91,99 @@ class ExecBridge(p: AccelParams) extends Module {
     )
   io.parameterRequest.bits.block := block
   when(io.parameterRequest.fire) {
-    state := waitParameter
-  }
-
-  io.parameterResponse.ready := state === waitParameter
-  when(io.parameterResponse.fire) {
-    decoded := io.parameterResponse.bits
-    state := writeParameter
+    state := streamParameter
   }
 
   private val binaryMode =
     contextReg.arrayMode === ArrayMode.binary.U
+  // Decode only the two lanes carried by the registered Parameter Buffer
+  // response. No complete-block or dual-interpretation register remains.
+  private val parameterRow = io.parameterResponse.bits
+  private val records = VecInit(
+    parameterRow.data(255, 0),
+    parameterRow.data(511, 256)
+  )
+
+  io.multiParameter.bits :=
+    0.U.asTypeOf(new ConvParamPairWrite(p))
+  io.multiParameter.bits.block := parameterRow.block
+  io.multiParameter.bits.lanePair := parameterRow.lanePair
+  io.binaryParameter.bits :=
+    0.U.asTypeOf(new BinParamPairWrite(p))
+  io.binaryParameter.bits.block := parameterRow.block
+  io.binaryParameter.bits.lanePair := parameterRow.lanePair
+  for (lane <- 0 until 2) {
+    val record = records(lane)
+
+    io.multiParameter.bits.bias(lane) := record(31, 0).asSInt
+    io.multiParameter.bits.post(lane).positiveShift :=
+      record(39, 32).asSInt
+    io.multiParameter.bits.post(lane).negativeCoeff1 :=
+      record(41, 40).asSInt
+    io.multiParameter.bits.post(lane).negativeCoeff2 :=
+      record(43, 42).asSInt
+    io.multiParameter.bits.post(lane).negativeLeftShift1 :=
+      record(48, 44)
+    io.multiParameter.bits.post(lane).negativeLeftShift2 :=
+      record(53, 49)
+    io.multiParameter.bits.post(lane).negativeCommonShift :=
+      record(61, 54).asSInt
+    io.multiParameter.bits.post(lane).qMin :=
+      record(93, 62).asSInt
+    io.multiParameter.bits.post(lane).qMax :=
+      record(125, 94).asSInt
+    io.multiParameter.bits.binaryThreshold(lane) :=
+      record(157, 126).asSInt
+
+    io.binaryParameter.bits.post(lane).threshold :=
+      record(31, 0).asSInt
+    io.binaryParameter.bits.post(lane).positiveCoeff2 :=
+      record(33, 32).asSInt
+    io.binaryParameter.bits.post(lane).positiveLeftShift1 :=
+      record(38, 34)
+    io.binaryParameter.bits.post(lane).positiveLeftShift2 :=
+      record(43, 39)
+    io.binaryParameter.bits.post(lane).positiveCommonShift :=
+      record(51, 44).asSInt
+    io.binaryParameter.bits.post(lane).positiveBias :=
+      record(83, 52).asSInt
+    io.binaryParameter.bits.post(lane).negativeCoeff1 :=
+      record(85, 84).asSInt
+    io.binaryParameter.bits.post(lane).negativeCoeff2 :=
+      record(87, 86).asSInt
+    io.binaryParameter.bits.post(lane).negativeLeftShift1 :=
+      record(92, 88)
+    io.binaryParameter.bits.post(lane).negativeLeftShift2 :=
+      record(97, 93)
+    io.binaryParameter.bits.post(lane).negativeCommonShift :=
+      record(105, 98).asSInt
+    io.binaryParameter.bits.post(lane).negativeBias :=
+      record(137, 106).asSInt
+    io.binaryParameter.bits.post(lane).qMin :=
+      record(169, 138).asSInt
+    io.binaryParameter.bits.post(lane).qMax :=
+      record(201, 170).asSInt
+    io.binaryParameter.bits.outputSignThreshold(lane) :=
+      record(233, 202).asSInt
+  }
+
   io.multiParameter.valid :=
-    state === writeParameter && !binaryMode
-  io.multiParameter.bits := decoded.multiBit
+    state === streamParameter &&
+      io.parameterResponse.valid && !binaryMode
   io.binaryParameter.valid :=
-    state === writeParameter && binaryMode
-  io.binaryParameter.bits := decoded.binary
-  private val parameterWritten =
-    io.multiParameter.fire || io.binaryParameter.fire
-  when(parameterWritten) {
-    when(block === blocks - 1.U) {
-      state := issueCommand
-    }.otherwise {
-      block := block + 1.U
-      state := requestParameter
+    state === streamParameter &&
+      io.parameterResponse.valid && binaryMode
+  io.parameterResponse.ready :=
+    state === streamParameter &&
+      Mux(binaryMode, io.binaryParameter.ready, io.multiParameter.ready)
+  when(io.parameterResponse.fire) {
+    when(parameterRow.last) {
+      when(block === blocks - 1.U) {
+        state := issueCommand
+      }.otherwise {
+        block := block + 1.U
+        state := requestParameter
+      }
     }
   }
 

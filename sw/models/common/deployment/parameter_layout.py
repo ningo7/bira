@@ -256,11 +256,14 @@ def binary_correction(
     input_channels: int,
     lanes: int = LANES,
 ) -> bytes:
-    """Pack compiler-computed per-pixel ``-N`` values into Parameter rows.
+    """Pack per-pixel binary-convolution biases (``-N``) into Parameter rows.
 
-    Corrections do not vary across output channels, so one native 64-byte row
-    stores 16 signed-int32 pixel values instead of repeating one value across
-    all 16 lanes. The final row is zero-padded.
+    Hardware uses each value to initialize all output-channel lanes of the
+    corresponding Accumulator row before adding ``2 * popcount``. These biases
+    do not vary across output channels, so one native 64-byte row stores 16
+    signed-int32 pixel values instead of repeating one value across all 16
+    lanes. The final row is zero-padded. The function name remains unchanged
+    to preserve the deployment ABI.
     """
 
     if min(

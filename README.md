@@ -115,7 +115,7 @@ A bipolar binary dot product is:
 dot = 2 × popcount(XNOR(a, w)) - N
 ```
 
-The array and Accumulator retain `2 × popcount`, while the Parameter Buffer supplies a correction equal to `-N` for the valid kernel and channel count. The post-processing stage applies this correction directly. Scaling, thresholding, RPReLU, residual addition, saturation, and optional rebinarization can continue along the same path, reducing standalone operators and intermediate writes.
+The Parameter Buffer supplies a per-pixel binary-convolution bias equal to `-N` for the valid kernel and channel count. The controller initializes the Accumulator row with this bias, and the array then accumulates `2 × popcount`; post-processing therefore receives `2 × popcount - N` directly. Scaling, thresholding, RPReLU, residual addition, saturation, and optional rebinarization continue along the same path, reducing standalone operators and intermediate writes.
 
 ### Fused Scale and PReLU/RPReLU
 
@@ -150,7 +150,7 @@ BIRA uses Rocket's `CUSTOM_3` opcode and separates static layer configuration fr
 
 Load, Execute, and Store enter independent queues. The scheduler checks dependencies using the bank read/write sets declared by each Context and allows younger, independent tasks to bypass an older blocked task. Context snapshots ensure that later configuration commands cannot change the semantics of queued tasks, while `FENCE` establishes a software-visible completion boundary.
 
-External DRAM addresses are byte addresses, while local SPAD, Accumulator, and Parameter Buffer addresses are expressed in rows. Each 64-byte Parameter Buffer record contains bias, requantization, threshold, correction, and other post-processing parameters.
+External DRAM addresses are byte addresses, while local SPAD, Accumulator, and Parameter Buffer addresses are expressed in rows. Each 64-byte Parameter Buffer row contains two 256-bit output-lane records or sixteen packed correction values. Parameter rows stream into the Core two lanes per cycle, avoiding a full-block parameter broadcast.
 
 ## Software Stack
 
@@ -181,14 +181,30 @@ The runtime offers two backends. The RoCC Driver executes real RV64 instructions
 
 ## Verification Results
 
-BIRA uses layered verification across software unit tests, ChiselTest, standalone Verilator, and Chipyard Verilator. The recorded BFSRCNN x4 test uses a 32×32 grayscale input and produces a 128×128 output. The optimized standalone RTL passes the 16,384-byte golden-output check. A current-version Chipyard end-to-end result has not yet been measured.
+BIRA uses layered verification across software unit tests, ChiselTest, standalone Verilator, and Chipyard Verilator. The recorded BFSRCNN x4 test uses a 32×32 grayscale input and produces a 128×128 output. Both the standalone RTL and the current 128-bit Rocket/TileLink integration pass the 16,384-byte golden-output check.
 
 | Result | Value |
 |---|---:|
-| Latest recorded optimized standalone BIRA RTL, 14-layer effective inference | 4,602,938 cycles |
-| Standalone latency at an assumed 200 MHz | 23.015 ms |
-| Standalone theoretical frame rate at an assumed 200 MHz | 43.45 FPS |
-| Current-version Chipyard `bfsrcnn_infer()` | Pending remeasurement |
+| Current 128-bit standalone BIRA RTL, 14-layer effective inference | 4,602,915 cycles |
+| Standalone latency / frame rate using the FPGA post-route frequency | 29.758 ms / 33.60 FPS |
+| Current 128-bit Chipyard `bfsrcnn_infer()` | 4,898,946 cycles |
+| Chipyard latency / frame rate at VC707 50 MHz | 97.979 ms / 10.21 FPS |
+| Chipyard latency / frame rate using the FPGA post-route frequency | 31.672 ms / 31.57 FPS |
+
+### FPGA Synthesis and Place-and-Route Results
+
+The following results are from OOC synthesis and place-and-route of BIRA on the VC707 `xc7vx485tffg1761-2`. The post-route WNS is -1.465 ns, corresponding to an estimated maximum frequency of 154.7 MHz. BFSRCNN frame rate is calculated using this routed frequency.
+
+| Metric | Result |
+|---|---:|
+| LUT | 98,268 |
+| FF | 104,421 |
+| DSP48E1 | 24 |
+| RAMB36 | 61 |
+| RAMB18 | 6 |
+| Estimated maximum frequency | 154.7 MHz |
+| Latency per 32×32 input frame | 31.672 ms |
+| 32×32 input frame rate | 31.57 FPS |
 
 ## Quick Start
 

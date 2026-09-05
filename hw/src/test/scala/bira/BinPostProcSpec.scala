@@ -28,9 +28,9 @@ class BinPostProcSpec
       dut.clock.step()
       dut.reset.poke(false.B)
 
-      val accumulator = Seq(8, -5, 100, -100)
+      // The binary correction is already folded into the Accumulator values.
+      val accumulator = Seq(4, -9, 96, -104)
       val residual = Seq(3, 7, 80, -80)
-      dut.io.correction.poke((-4).S)
 
       for (lane <- 0 until p.dim) {
         dut.io.accumulator(lane).poke(accumulator(lane).S)

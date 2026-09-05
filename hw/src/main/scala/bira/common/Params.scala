@@ -87,6 +87,8 @@ case class AccelParams(
   val accumulatorAddressBits: Int = log2Ceil(accumulatorRows)
   val parameterAddressBits: Int = log2Ceil(parameterRows)
   val parameterRowsPerBlock: Int = (dim + 1) / 2
+  val parameterLanePairBits: Int =
+    log2Ceil(parameterRowsPerBlock max 2)
   val correctionEntriesPerRow: Int = 512 / accumulatorBits
   val correctionEntryIndexBits: Int =
     log2Ceil(correctionEntriesPerRow max 2)

@@ -95,7 +95,7 @@ class ComputeArrayDispatchSpec extends AnyFreeSpec with Matchers {
               packed |
                 ((BigInt(operandWeights(operand)) & groupMask) <<
                   (operand * precision))
-          }
+        }
 
         dut.io.weightPrecision.poke(precision.U)
         dut.io.output.valid.expect(true.B)

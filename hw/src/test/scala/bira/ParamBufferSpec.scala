@@ -5,7 +5,7 @@ import chisel3.simulator.EphemeralSimulator._
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
-/** Checks the frozen 256-bit lane-record ABI in both interpretations. */
+/** Checks raw two-lane parameter streaming and packed correction reads. */
 class ParamBufferSpec extends AnyFreeSpec with Matchers {
   private def bits(value: BigInt, width: Int): BigInt =
     value & ((BigInt(1) << width) - 1)
@@ -50,7 +50,7 @@ class ParamBufferSpec extends AnyFreeSpec with Matchers {
       field(900 + lane, 202, 32)
   }
 
-  "raw DMA rows decode into multi-bit and binary parameter blocks" in {
+  "raw DMA rows must stream in two-lane order before correction reads" in {
     val p = AccelParams(
       dim = 4,
       fullBanks = 4,
@@ -86,68 +86,61 @@ class ParamBufferSpec extends AnyFreeSpec with Matchers {
         dut.io.write.valid.poke(false.B)
       }
 
-      def requestBlock(baseRow: Int, block: Int): Unit = {
+      def requestBlock(
+        baseRow: Int,
+        block: Int,
+        stall: Boolean = false
+      ): Seq[BigInt] = {
         dut.io.readRequest.bits.baseRow.poke(baseRow.U)
         dut.io.readRequest.bits.block.poke(block.U)
         dut.io.readRequest.valid.poke(true.B)
         dut.io.readRequest.ready.expect(true.B)
         dut.clock.step()
         dut.io.readRequest.valid.poke(false.B)
-
+        val rows = scala.collection.mutable.ArrayBuffer.empty[BigInt]
         var cycles = 0
-        while (!dut.io.readResponse.valid.peek().litToBoolean && cycles < 20) {
+        while (rows.length < p.parameterRowsPerBlock && cycles < 40) {
+          val ready = !stall || cycles % 3 != 1
+          dut.io.readResponse.ready.poke(ready.B)
+          if (dut.io.readResponse.valid.peek().litToBoolean) {
+            val pair = rows.length
+            dut.io.readResponse.bits.block.expect(block.U)
+            dut.io.readResponse.bits.lanePair.expect(pair.U)
+            dut.io.readResponse.bits.last.expect(
+              (pair == p.parameterRowsPerBlock - 1).B
+            )
+            if (ready) {
+              rows += dut.io.readResponse.bits.data.peek().litValue
+            }
+          }
           dut.clock.step()
           cycles += 1
         }
-        dut.io.readResponse.valid.expect(true.B)
+        dut.io.readResponse.ready.poke(false.B)
+        withClue(s"parameter row stream timed out after $cycles cycles") {
+          rows.length mustBe p.parameterRowsPerBlock
+        }
+        rows.toSeq
       }
 
-      writeBlock(baseRow = 0, (0 until p.dim).map(packMulti))
-      requestBlock(baseRow = 0, block = 0)
-      for (lane <- 0 until p.dim) {
-        val expectedBias = if (lane % 2 == 0) -100 - lane else 100 + lane
-        dut.io.readResponse.bits.multiBit.bias(lane)
-          .expect(expectedBias.S)
-        dut.io.readResponse.bits.multiBit.post(lane).positiveShift
-          .expect((-8 + lane).S)
-        dut.io.readResponse.bits.multiBit.post(lane).negativeCoeff1
-          .expect((-1).S)
-        dut.io.readResponse.bits.multiBit.post(lane).negativeCoeff2
-          .expect(1.S)
-        dut.io.readResponse.bits.multiBit.post(lane).qMin
-          .expect((-1000 - lane).S)
-        dut.io.readResponse.bits.multiBit.post(lane).qMax
-          .expect((2000 + lane).S)
-        dut.io.readResponse.bits.multiBit.binaryThreshold(lane)
-          .expect((-300 + lane).S)
+      val multiRecords = (0 until p.dim).map(packMulti)
+      writeBlock(baseRow = 0, multiRecords)
+      val multiRows = requestBlock(baseRow = 0, block = 0, stall = true)
+      multiRows.zipWithIndex.foreach { case (row, pair) =>
+        row mustBe
+          (multiRecords(2 * pair) | (multiRecords(2 * pair + 1) << 256))
       }
-      dut.io.readResponse.ready.poke(true.B)
-      dut.clock.step()
-      dut.io.readResponse.ready.poke(false.B)
 
-      writeBlock(baseRow = 8, (0 until p.dim).map(packBinary))
+      val binaryRecords = (0 until p.dim).map(packBinary)
+      writeBlock(baseRow = 8, binaryRecords)
       for (lane <- 0 until p.dim) {
         ((packBinary(lane) >> 86) & 3) mustBe 3
       }
-      requestBlock(baseRow = 8, block = 0)
-      for (lane <- 0 until p.dim) {
-        val post = dut.io.readResponse.bits.binary.post(lane)
-        withClue(s"binary lane $lane: ") {
-          post.threshold.expect((-40 + lane).S)
-          post.positiveCoeff2.expect((-1).S)
-          post.positiveBias.expect((500 + lane).S)
-          post.negativeCoeff1.expect(1.S)
-          post.negativeCoeff2.expect((-1).S)
-          post.negativeBias.expect((-600 - lane).S)
-          post.qMin.expect((-700 - lane).S)
-          post.qMax.expect((800 + lane).S)
-          dut.io.readResponse.bits.binary.outputSignThreshold(lane)
-            .expect((900 + lane).S)
-        }
+      val binaryRows = requestBlock(baseRow = 8, block = 0)
+      binaryRows.zipWithIndex.foreach { case (row, pair) =>
+        row mustBe
+          (binaryRecords(2 * pair) | (binaryRecords(2 * pair + 1) << 256))
       }
-      dut.io.readResponse.ready.poke(true.B)
-      dut.clock.step()
-      dut.io.readResponse.ready.poke(false.B)
 
       val correctionRow = (0 until p.correctionEntriesPerRow).foldLeft(
         BigInt(0)

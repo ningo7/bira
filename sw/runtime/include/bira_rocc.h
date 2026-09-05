@@ -24,6 +24,7 @@ enum bira_addr_role {
     BIRA_ROLE_WEIGHT_HIGH   = 2,
     BIRA_ROLE_PARAM         = 3,
     BIRA_ROLE_RESIDUAL      = 4,
+    /* Packed per-pixel binary Accumulator initialization biases (-N). */
     BIRA_ROLE_CORRECTION    = 5,
     BIRA_ROLE_ACCUMULATOR   = 6,
     BIRA_ROLE_OUTPUT_FULL   = 7,

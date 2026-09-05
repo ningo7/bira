@@ -180,7 +180,12 @@ class ConvCtrl(p: AccelParams) extends Module {
     Reg(SInt((p.fullAddressBits + 2).W))
   private val activationAddressRegister = Reg(UInt(p.fullAddressBits.W))
   private val activationLaneRegister = Reg(UInt(p.laneIndexBits.W))
-  private val inputGroupChannelBase = RegInit(0.U(p.channelCountBits.W))
+  private val activationFetchRequiredRegister = RegInit(false.B)
+  // Every command and output-block transition initializes this register
+  // before it is consumed. Avoid a global synchronous reset mux on its live
+  // update path; that mux had acquired completion-queue control as a long
+  // route to the register R pins after synthesis.
+  private val inputGroupChannelBase = Reg(UInt(p.channelCountBits.W))
   // Kernel-tap origins advance incrementally.  This removes the two cascaded
   // multipliers previously used each time a tile began.
   private val kernelSpatialStart = Reg(SInt(spatialIndexBits.W))
@@ -241,24 +246,14 @@ class ConvCtrl(p: AccelParams) extends Module {
     Reg(Vec(p.dim, SInt(p.accumulatorBits.W)))
   private val residualRow =
     Reg(Vec(p.dim, UInt(p.activationBits.W)))
-  // Registered occupancy terminates ready propagation across SPAD,
-  // Accumulator, and the controller state.  Two slots still support one
-  // simultaneous enqueue/dequeue per cycle in the normal streaming case.
+  // Two-slot, non-transparent timing buffers prevent downstream ready from
+  // propagating combinationally across VecAccum. They preserve steady-state
+  // II=1 but do not provide task scheduling or reordering.
   private val completionQueue = Module(
-    new Queue(
-      new ConvCompletion(p),
-      entries = 2,
-      pipe = false,
-      flow = false
-    )
+    new TwoEntryBuffer(new ConvCompletion(p))
   )
   private val accumulatorTaskQueue = Module(
-    new Queue(
-      new ConvAccumulatorTask(p),
-      entries = 2,
-      pipe = false,
-      flow = false
-    )
+    new TwoEntryBuffer(new ConvAccumulatorTask(p))
   )
   private val accumulatorOutstanding = RegInit(0.U(2.W))
   private val outputBufferValid = RegInit(false.B)
@@ -320,8 +315,6 @@ class ConvCtrl(p: AccelParams) extends Module {
       signedInputX < 0.S ||
       signedInputX >= commandRegister.inputWidth.zext
 
-  private val activeInputChannel =
-    inputGroupChannelBase + activationOperand
   private val depthwiseInputAddress =
     depthwiseAddressRegister.asUInt(p.fullAddressBits - 1, 0)
   private val reducedInputAddress =
@@ -340,30 +333,51 @@ class ConvCtrl(p: AccelParams) extends Module {
       p.shuffleScaleBits - 1,
       0
     )
+  // shuffleScale is constrained to a power of two. Express these products
+  // as shifts so Vivado does not build a cascaded DSP address datapath.
   private val shuffledWidth =
-    commandRegister.outputWidth * shuffleScale
+    commandRegister.outputWidth << commandRegister.shuffleLog2
   private val postShuffleSubPixel0 = postBlock << 1
   private val postShuffleSubY =
     postShuffleSubPixel0 >> commandRegister.shuffleLog2
   private val postShuffleSubX =
     postShuffleSubPixel0 & (shuffleScale - 1.U)
   private val postShuffledY =
-    postOutputY * shuffleScale + postShuffleSubY
+    (postOutputY << commandRegister.shuffleLog2) + postShuffleSubY
   private val postShuffledX =
-    postOutputX * shuffleScale + postShuffleSubX
-  private val postShuffledPixel0 =
-    postShuffledY * shuffledWidth + postShuffledX
+    (postOutputX << commandRegister.shuffleLog2) + postShuffleSubX
   private val postNormalOutputOffset =
     postNormalOffsetRegister
-  private val postFullOutputOffset = Mux(
+  private val postNormalOrColumnOffset = Mux(
     commandRegister.columnReduce,
     postPixel >> p.laneIndexBits,
-    Mux(
-      commandRegister.shufflePack2,
-      postShuffledPixel0 >> 1,
-      postNormalOutputOffset
-    )
+    postNormalOutputOffset
   )
+
+  // Prepare the post-processing write addresses in parallel with the much
+  // longer arithmetic pipeline. Keeping coordinate formation, the shuffled
+  // row multiply, and output-base addition in separate cycles removes the
+  // former postBlock -> DSP -> CARRY4 -> outputFullAddress path without adding
+  // a post-processing cycle.
+  private val postAddressCoordinateValid = RegInit(false.B)
+  private val postAddressProductValid = RegInit(false.B)
+  private val postAddressFinalizeValid = RegInit(false.B)
+  private val postAddressPreparedValid = RegInit(false.B)
+  private val postAddressY = Reg(chiselTypeOf(postShuffledY))
+  private val postAddressX = Reg(chiselTypeOf(postShuffledX))
+  private val postAddressWidth = Reg(chiselTypeOf(shuffledWidth))
+  private val postAddressNormalOffset = Reg(UInt(p.fullAddressBits.W))
+  private val postAddressBinaryOffset = Reg(UInt(p.binaryAddressBits.W))
+  private val postAddressUsesShuffle = Reg(Bool())
+  private val postAddressShuffleOffset = Reg(UInt(p.fullAddressBits.W))
+  private val postAddressProductNormalOffset =
+    Reg(UInt(p.fullAddressBits.W))
+  private val postAddressProductBinaryOffset =
+    Reg(UInt(p.binaryAddressBits.W))
+  private val postAddressProductUsesShuffle = Reg(Bool())
+  private val preparedFullOutputAddress = Reg(UInt(p.fullAddressBits.W))
+  private val preparedBinaryOutputAddress =
+    Reg(UInt(p.binaryAddressBits.W))
 
   /** Load the first activation address of the current kernel/input tile.
     * The multiplications occur only at the tile boundary; the live pixel path
@@ -398,6 +412,8 @@ class ConvCtrl(p: AccelParams) extends Module {
       0.U,
       linearIndex(p.laneIndexBits - 1, 0)
     )
+    activationFetchRequiredRegister :=
+      commandRegister.depthwise || channel < commandRegister.inputChannels
   }
 
   /** Start filling the inactive weight buffer with the next global tile. */
@@ -849,9 +865,48 @@ class ConvCtrl(p: AccelParams) extends Module {
     is("b01".U) { accumulatorOutstanding := accumulatorOutstanding - 1.U }
   }
 
+  // Output-address pipeline. A completion remains in post-processing for at
+  // least IntPostProc.latency cycles, so these three address stages complete
+  // before postEnqueueOutput without extending externally visible latency.
+  postAddressCoordinateValid := false.B
+  postAddressProductValid := postAddressCoordinateValid
+  postAddressFinalizeValid := postAddressProductValid
+  when(postAddressCoordinateValid) {
+    postAddressY := postShuffledY
+    postAddressX := postShuffledX
+    postAddressWidth := shuffledWidth
+    postAddressNormalOffset := postNormalOrColumnOffset
+    postAddressBinaryOffset := postBinaryOffsetRegister
+    postAddressUsesShuffle :=
+      commandRegister.shufflePack2 && !commandRegister.columnReduce
+  }
+  when(postAddressProductValid) {
+    val shuffledPixel = postAddressY * postAddressWidth + postAddressX
+    postAddressShuffleOffset :=
+      (shuffledPixel >> 1).pad(p.fullAddressBits)(
+        p.fullAddressBits - 1,
+        0
+      )
+    postAddressProductNormalOffset := postAddressNormalOffset
+    postAddressProductBinaryOffset := postAddressBinaryOffset
+    postAddressProductUsesShuffle := postAddressUsesShuffle
+  }
+  when(postAddressFinalizeValid) {
+    val selectedOffset = Mux(
+      postAddressProductUsesShuffle,
+      postAddressShuffleOffset,
+      postAddressProductNormalOffset
+    )
+    preparedFullOutputAddress :=
+      commandRegister.outputBase + selectedOffset
+    preparedBinaryOutputAddress :=
+      commandRegister.binaryOutputBase + postAddressProductBinaryOffset
+    postAddressPreparedValid := true.B
+  }
+
   // Completion processing is independent of the convolution state machine.
-  // The elastic boundary preserves in-order transfer while this side performs
-  // interpolation, post-processing, and SPAD writeback.
+  // The registered completion cut preserves in-order transfer while keeping
+  // post/SPAD readiness out of the Accumulator response timing path.
   switch(postState) {
     is(postIdle) {
       when(completionQueue.io.deq.valid) {
@@ -868,6 +923,7 @@ class ConvCtrl(p: AccelParams) extends Module {
         postBinaryOffsetRegister := nextPostBinaryOffset
         nextPostBinaryOffset :=
           nextPostBinaryOffset + commandRegister.outputBlocks
+        postAddressCoordinateValid := true.B
         residualRow :=
           VecInit.fill(p.dim)(0.U(p.activationBits.W))
         postState := Mux(
@@ -924,13 +980,16 @@ class ConvCtrl(p: AccelParams) extends Module {
 
     is(postEnqueueOutput) {
       when(!outputBufferValid) {
+        assert(
+          postAddressPreparedValid,
+          "post output address pipeline must complete before writeback"
+        )
         outputBufferValid := true.B
         outputFullPending := commandRegister.writeFullOutput
         outputBinaryPending := commandRegister.writeBinaryOutput
-        outputFullAddress :=
-          commandRegister.outputBase + postFullOutputOffset
-        outputBinaryAddress :=
-          commandRegister.binaryOutputBase + postBinaryOffsetRegister
+        outputFullAddress := preparedFullOutputAddress
+        outputBinaryAddress := preparedBinaryOutputAddress
+        postAddressPreparedValid := false.B
         for (lane <- 0 until p.dim) {
           val finalSum =
             completedPostOutput(lane).pad(p.accumulatorBits + 1) +
@@ -1318,10 +1377,7 @@ class ConvCtrl(p: AccelParams) extends Module {
     }
 
     is(issueActivationFetch) {
-      when(
-        !commandRegister.depthwise &&
-          activeInputChannel >= commandRegister.inputChannels
-      ) {
+      when(!activationFetchRequiredRegister) {
         fetchedActivations(activationOperand) := 0.U
         advanceAfterActivation()
       }.otherwise {

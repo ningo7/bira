@@ -40,12 +40,13 @@ class BinaryLayersSpec extends AnyFreeSpec with Matchers {
       accumulatorBanks = 1,
       bankRows = 256,
       maxImageHeight = 2,
-      maxImageWidth = 3,
+      maxImageWidth = 9,
       maxInputChannels = 16,
       maxOutputBlocks = 1
     )
     val height = 2
-    val width = 3
+    // Eighteen pixels cross the 16-entry Parameter Buffer packing boundary.
+    val width = 9
     val pixels = height * width
     val kernel = 3
 
@@ -213,33 +214,37 @@ class BinaryLayersSpec extends AnyFreeSpec with Matchers {
 
       def writeParameters(signThresholds: Seq[Int]): Unit = {
         dut.io.binaryParameterWrite.bits.block.poke(0.U)
-        for (lane <- 0 until p.dim) {
-          val parameters =
-            dut.io.binaryParameterWrite.bits.post(lane)
-          parameters.threshold.poke(0.S)
-          parameters.positiveCoeff2.poke(1.S)
-          parameters.positiveLeftShift1.poke(0.U)
-          parameters.positiveLeftShift2.poke(1.U)
-          parameters.positiveCommonShift.poke((-1).S)
-          parameters.positiveBias.poke(1.S)
-          parameters.negativeCoeff1.poke((-1).S)
-          parameters.negativeCoeff2.poke(0.S)
-          parameters.negativeLeftShift1.poke(0.U)
-          parameters.negativeLeftShift2.poke(0.U)
-          parameters.negativeCommonShift.poke(0.S)
-          parameters.negativeBias.poke((-2).S)
-          parameters.qMin.poke((-128).S)
-          parameters.qMax.poke(127.S)
-          dut.io.binaryParameterWrite.bits
-            .outputSignThreshold(lane)
-            .poke(signThresholds(lane).S)
-        }
-        dut.io.binaryParameterWrite.valid.poke(true.B)
-        while (!dut.io.binaryParameterWrite.ready.peek().litToBoolean) {
+        for (lanePair <- 0 until p.parameterRowsPerBlock) {
+          dut.io.binaryParameterWrite.bits.lanePair.poke(lanePair.U)
+          for (laneInRow <- 0 until 2) {
+            val lane = lanePair * 2 + laneInRow
+            val parameters =
+              dut.io.binaryParameterWrite.bits.post(laneInRow)
+            parameters.threshold.poke(0.S)
+            parameters.positiveCoeff2.poke(1.S)
+            parameters.positiveLeftShift1.poke(0.U)
+            parameters.positiveLeftShift2.poke(1.U)
+            parameters.positiveCommonShift.poke((-1).S)
+            parameters.positiveBias.poke(1.S)
+            parameters.negativeCoeff1.poke((-1).S)
+            parameters.negativeCoeff2.poke(0.S)
+            parameters.negativeLeftShift1.poke(0.U)
+            parameters.negativeLeftShift2.poke(0.U)
+            parameters.negativeCommonShift.poke(0.S)
+            parameters.negativeBias.poke((-2).S)
+            parameters.qMin.poke((-128).S)
+            parameters.qMax.poke(127.S)
+            dut.io.binaryParameterWrite.bits
+              .outputSignThreshold(laneInRow)
+              .poke(signThresholds(lane).S)
+          }
+          dut.io.binaryParameterWrite.valid.poke(true.B)
+          while (!dut.io.binaryParameterWrite.ready.peek().litToBoolean) {
+            dut.clock.step()
+          }
           dut.clock.step()
+          dut.io.binaryParameterWrite.valid.poke(false.B)
         }
-        dut.clock.step()
-        dut.io.binaryParameterWrite.valid.poke(false.B)
       }
 
       def runLayer(

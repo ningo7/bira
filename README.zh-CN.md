@@ -188,14 +188,29 @@ Runtime 提供两种后端：RoCC Driver 在 Chipyard 中执行真实 RV64 指�
 
 ## 测试验证
 
-BIRA 采用软件单元测试、ChiselTest、独立 Verilator 和 Chipyard Verilator 的分层验证流程。当前记录的 BFSRCNN x4 测试以 32×32 灰度图为输入、128×128 图像为输出。优化后的独立 RTL 已通过 16,384 B golden 输出校验；当前版本的 Chipyard 端到端性能尚待重新实测。
+BIRA 采用软件单元测试、ChiselTest、独立 Verilator 和 Chipyard Verilator 的分层验证流程。当前记录的 BFSRCNN x4 测试以 32×32 灰度图为输入、128×128 图像为输出。独立 RTL 与当前 Rocket/TileLink 集成均已通过 16,384 B golden 输出校验。
 
 | 结果 | 数值 |
 |---|---:|
-| 最近一次实测的优化后独立 BIRA RTL，14 层有效推理 | 4,602,938 周期 |
-| 按 200 MHz 换算的独立 RTL 单帧延迟 | 23.015 ms |
-| 按 200 MHz 换算的独立 RTL 理论帧率 | 43.45 FPS |
-| 当前版本 Chipyard `bfsrcnn_infer()` | 待重新实测 |
+| 当前独立 BIRA RTL，14 层有效推理 | 4,602,915 周期 |
+| 独立 RTL 按 FPGA 综合布局布线频率换算 | 29.758 ms / 33.60 FPS |
+| 当前 Chipyard `bfsrcnn_infer()` | 4,898,946 周期 |
+| Chipyard 按 FPGA 综合布局布线频率换算 | 31.672 ms / 31.57 FPS |
+
+### FPGA 综合布局布线结果
+
+以下为 BIRA 在 VC707 `xc7vx485tffg1761-2` 上的 OOC 综合布局布线结果。布线后 WNS 为 -1.465 ns，对应等效最高频率约 154.7 MHz；BFSRCNN 帧率采用该频率换算。
+
+| 指标 | 结果 |
+|---|---:|
+| LUT | 98,268 |
+| FF | 104,421 |
+| DSP48E1 | 24 |
+| RAMB36 | 61 |
+| RAMB18 | 6 |
+| 等效最高频率 | 154.7 MHz |
+| 32×32 输入单帧延迟 | 31.672 ms |
+| 32×32 输入帧率 | 31.57 FPS |
 
 ## 快速开始
 

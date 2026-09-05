@@ -19,9 +19,9 @@ class Core(p: AccelParams = AccelParams()) extends Module {
     val binaryCommand =
       Flipped(Decoupled(new BinaryConvolutionCommand(p)))
     val parameterWrite =
-      Flipped(Decoupled(new ConvParamWrite(p)))
+      Flipped(Decoupled(new ConvParamPairWrite(p)))
     val binaryParameterWrite =
-      Flipped(Decoupled(new BinParamWrite(p)))
+      Flipped(Decoupled(new BinParamPairWrite(p)))
     val accumulatorWrite =
       Flipped(Decoupled(new AccProgWrite(p)))
     val accumulatorReadRequest =
@@ -151,44 +151,52 @@ class Core(p: AccelParams = AccelParams()) extends Module {
   io.parameterWrite.ready :=
     !ctrlBusy &&
       !hostAccPending &&
-      io.parameterWrite.bits.block < p.maxOutputBlocks.U
+      io.parameterWrite.bits.block < p.maxOutputBlocks.U &&
+      io.parameterWrite.bits.lanePair < p.parameterRowsPerBlock.U
   when(io.parameterWrite.fire) {
-    if (p.maxOutputBlocks == 1) {
-      biasRegs(0) := io.parameterWrite.bits.bias
-      postParamRegs(0) := io.parameterWrite.bits.post
-      binThreshRegs(0) :=
-        io.parameterWrite.bits.binaryThreshold
-    } else {
-      val indexBits = log2Ceil(p.maxOutputBlocks)
-      val parameterBlock =
-        io.parameterWrite.bits.block(indexBits - 1, 0)
-      biasRegs(parameterBlock) :=
-        io.parameterWrite.bits.bias
-      postParamRegs(parameterBlock) :=
-        io.parameterWrite.bits.post
-      binThreshRegs(parameterBlock) :=
-        io.parameterWrite.bits.binaryThreshold
+    val parameterBlock =
+      if (p.maxOutputBlocks == 1) 0.U
+      else
+        io.parameterWrite.bits.block(
+          log2Ceil(p.maxOutputBlocks) - 1,
+          0
+        )
+    for (laneInRow <- 0 until 2) {
+      val lane = Cat(
+        io.parameterWrite.bits.lanePair,
+        laneInRow.U(1.W)
+      )
+      biasRegs(parameterBlock)(lane) :=
+        io.parameterWrite.bits.bias(laneInRow)
+      postParamRegs(parameterBlock)(lane) :=
+        io.parameterWrite.bits.post(laneInRow)
+      binThreshRegs(parameterBlock)(lane) :=
+        io.parameterWrite.bits.binaryThreshold(laneInRow)
     }
   }
 
   io.binaryParameterWrite.ready :=
     !ctrlBusy &&
       !hostAccPending &&
-      io.binaryParameterWrite.bits.block < p.maxOutputBlocks.U
+      io.binaryParameterWrite.bits.block < p.maxOutputBlocks.U &&
+      io.binaryParameterWrite.bits.lanePair < p.parameterRowsPerBlock.U
   when(io.binaryParameterWrite.fire) {
-    if (p.maxOutputBlocks == 1) {
-      binPostParamRegs(0) :=
-        io.binaryParameterWrite.bits.post
-      binSignThreshRegs(0) :=
-        io.binaryParameterWrite.bits.outputSignThreshold
-    } else {
-      val indexBits = log2Ceil(p.maxOutputBlocks)
-      val parameterBlock =
-        io.binaryParameterWrite.bits.block(indexBits - 1, 0)
-      binPostParamRegs(parameterBlock) :=
-        io.binaryParameterWrite.bits.post
-      binSignThreshRegs(parameterBlock) :=
-        io.binaryParameterWrite.bits.outputSignThreshold
+    val parameterBlock =
+      if (p.maxOutputBlocks == 1) 0.U
+      else
+        io.binaryParameterWrite.bits.block(
+          log2Ceil(p.maxOutputBlocks) - 1,
+          0
+        )
+    for (laneInRow <- 0 until 2) {
+      val lane = Cat(
+        io.binaryParameterWrite.bits.lanePair,
+        laneInRow.U(1.W)
+      )
+      binPostParamRegs(parameterBlock)(lane) :=
+        io.binaryParameterWrite.bits.post(laneInRow)
+      binSignThreshRegs(parameterBlock)(lane) :=
+        io.binaryParameterWrite.bits.outputSignThreshold(laneInRow)
     }
   }
 
@@ -433,8 +441,6 @@ class Core(p: AccelParams = AccelParams()) extends Module {
     binCtrl.io.postInValid
   binPost.io.accumulator :=
     binCtrl.io.postAcc
-  binPost.io.correction :=
-    binCtrl.io.postCorrection
   binPost.io.residual :=
     binCtrl.io.postRes
   binPost.io.parameters :=
@@ -477,7 +483,7 @@ class Core(p: AccelParams = AccelParams()) extends Module {
         !io.binaryParameterWrite.fire &&
         !io.accumulatorWrite.fire &&
         !io.accumulatorReadRequest.fire,
-      "decoded parameters must remain stable while running"
+      "parameter registers must remain stable while running"
     )
   }
 }

@@ -18,23 +18,26 @@ class ParamRead(p: AccelParams) extends Bundle {
   val block = UInt(p.blockIndexBits.W)
 }
 
-/** Select one packed per-pixel binary correction from a Parameter row. */
+/** One raw ABI row returned with its destination block and lane pair. */
+class ParamRowResponse(p: AccelParams) extends Bundle {
+  val block = UInt(p.blockIndexBits.W)
+  val lanePair = UInt(p.parameterLanePairBits.W)
+  val data = UInt(512.W)
+  val last = Bool()
+}
+
+/** Read packed per-pixel binary accumulator biases from a Parameter row. */
 class CorrectionReq(p: AccelParams) extends Bundle {
   val address = UInt(p.parameterAddressBits.W)
 }
 
-/** Both interpretations are returned; arrayMode selects the consumer. */
-class DecodedParams(p: AccelParams) extends Bundle {
-  val multiBit = new ConvParamWrite(p)
-  val binary = new BinParamWrite(p)
-}
-
-/** DMA-writable raw Parameter Buffer with decoded and packed-table reads.
+/** DMA-writable raw Parameter Buffer with streaming and packed-table reads.
   *
   * Each 512-bit row stores two 256-bit lane records. A default 16-lane output
   * block therefore consumes eight rows. Multi-bit and binary layers use two
   * frozen record layouts over the same raw storage. A separate row range may
-  * pack 16 per-pixel signed-int32 binary corrections into each 512-bit row.
+  * pack 16 per-pixel signed-int32 binary accumulator biases into each
+  * 512-bit row. The public port keeps the correction name for ABI stability.
   */
 class ParamBuffer(p: AccelParams) extends Module {
   require(p.dim % 2 == 0, "parameter rows contain exactly two lane records")
@@ -52,7 +55,7 @@ class ParamBuffer(p: AccelParams) extends Module {
     val write = Flipped(Decoupled(new ParamWrite(p)))
     val readRequest =
       Flipped(Decoupled(new ParamRead(p)))
-    val readResponse = Decoupled(new DecodedParams(p))
+    val readResponse = Decoupled(new ParamRowResponse(p))
     val correctionReadRequest =
       Flipped(Decoupled(new CorrectionReq(p)))
     val correctionReadResponse =
@@ -60,9 +63,6 @@ class ParamBuffer(p: AccelParams) extends Module {
   })
 
   private val memory = SyncReadMem(p.parameterRows, UInt(512.W))
-  private val rows = Reg(
-    Vec(p.parameterRowsPerBlock, UInt(512.W))
-  )
   private val request =
     Reg(new ParamRead(p))
   private val correctionAddress =
@@ -72,16 +72,25 @@ class ParamBuffer(p: AccelParams) extends Module {
   private val rowIndexBits =
     log2Ceil(p.parameterRowsPerBlock max 2)
   private val issueIndex = RegInit(0.U(rowIndexBits.W))
+  // Includes both rows already buffered and the one-cycle synchronous-memory
+  // returns not yet enqueued. Two reservations are enough to sustain one raw
+  // row per cycle while remaining safe under downstream backpressure.
+  private val rowOutstanding = RegInit(0.U(2.W))
+  // Use register slots rather than an asynchronously-read Queue RAM. The
+  // payload is 520 bits wide, so a LUTRAM queue would add a wide read mux and
+  // concentrate routing precisely on the parameter path being shortened.
+  private val rowBuffer = Module(
+    new TwoEntryBuffer(new ParamRowResponse(p))
+  )
 
   private val Seq(
     idle,
-    reading,
-    draining,
-    sending,
-    readingCorrection,
-    drainingCorrection,
+    readingRows,
+    drainingRows,
+    issueCorrection,
+    waitCorrection,
     sendingCorrection
-  ) = Enum(7)
+  ) = Enum(6)
   private val state = RegInit(idle)
 
   io.write.ready := true.B
@@ -107,120 +116,74 @@ class ParamBuffer(p: AccelParams) extends Module {
     )
     request := io.readRequest.bits
     issueIndex := 0.U
-    state := reading
+    rowOutstanding := 0.U
+    state := readingRows
   }
   when(io.correctionReadRequest.fire) {
     correctionAddress := io.correctionReadRequest.bits.address
-    state := readingCorrection
+    state := issueCorrection
   }
 
   private val blockReadAddressWide =
     request.baseRow +
       request.block * p.parameterRowsPerBlock.U +
       issueIndex
-  private val readEnable =
-    state === reading || state === readingCorrection
+  private val rowConsumed = io.readResponse.fire
+  private val canIssueRow =
+    rowOutstanding < 2.U || rowConsumed
+  private val issueRow = state === readingRows && canIssueRow
+  private val readEnable = issueRow || state === issueCorrection
   private val readAddress = Mux(
-    state === readingCorrection,
+    state === issueCorrection,
     correctionAddress,
     blockReadAddressWide(p.parameterAddressBits - 1, 0)
   )
   private val readData = memory.read(readAddress, readEnable)
   private val returnedValid = RegNext(readEnable, false.B)
-  private val returnedIndex = RegEnable(issueIndex, readEnable)
   private val returnedCorrection =
-    RegNext(state === readingCorrection, false.B)
+    RegNext(state === issueCorrection, false.B)
+  private val returnedIndex = RegEnable(issueIndex, issueRow)
 
-  when(readEnable) {
-    when(state === readingCorrection) {
-      state := drainingCorrection
+  when(issueRow) {
+    when(issueIndex === (p.parameterRowsPerBlock - 1).U) {
+      state := drainingRows
     }.otherwise {
-      when(issueIndex === (p.parameterRowsPerBlock - 1).U) {
-        state := draining
-      }.otherwise {
-        issueIndex := issueIndex + 1.U
-      }
+      issueIndex := issueIndex + 1.U
     }
+  }
+  when(state === issueCorrection) {
+    state := waitCorrection
+  }
+
+  rowBuffer.io.enq.valid := returnedValid && !returnedCorrection
+  rowBuffer.io.enq.bits.block := request.block
+  rowBuffer.io.enq.bits.lanePair := returnedIndex
+  rowBuffer.io.enq.bits.data := readData
+  rowBuffer.io.enq.bits.last :=
+    returnedIndex === (p.parameterRowsPerBlock - 1).U
+  when(rowBuffer.io.enq.valid) {
+    assert(
+      rowBuffer.io.enq.ready,
+      "reserved parameter-row response buffer must have capacity"
+    )
   }
 
   when(returnedValid && returnedCorrection) {
     correctionValue := readData
     state := sendingCorrection
-  }.elsewhen(returnedValid) {
-    rows(returnedIndex) := readData
-    when(returnedIndex === (p.parameterRowsPerBlock - 1).U) {
-      state := sending
-    }
   }
 
-  private val decoded =
-    WireDefault(0.U.asTypeOf(new DecodedParams(p)))
-  decoded.multiBit.block := request.block
-  decoded.binary.block := request.block
-
-  for (lane <- 0 until p.dim) {
-    val row = rows(lane / 2)
-    val record =
-      if (lane % 2 == 0) row(255, 0) else row(511, 256)
-
-    // Multi-bit lane record.
-    decoded.multiBit.bias(lane) := record(31, 0).asSInt
-    decoded.multiBit.post(lane).positiveShift :=
-      record(39, 32).asSInt
-    decoded.multiBit.post(lane).negativeCoeff1 :=
-      record(41, 40).asSInt
-    decoded.multiBit.post(lane).negativeCoeff2 :=
-      record(43, 42).asSInt
-    decoded.multiBit.post(lane).negativeLeftShift1 :=
-      record(48, 44)
-    decoded.multiBit.post(lane).negativeLeftShift2 :=
-      record(53, 49)
-    decoded.multiBit.post(lane).negativeCommonShift :=
-      record(61, 54).asSInt
-    decoded.multiBit.post(lane).qMin :=
-      record(93, 62).asSInt
-    decoded.multiBit.post(lane).qMax :=
-      record(125, 94).asSInt
-    decoded.multiBit.binaryThreshold(lane) :=
-      record(157, 126).asSInt
-
-    // Binary lane record.
-    decoded.binary.post(lane).threshold :=
-      record(31, 0).asSInt
-    decoded.binary.post(lane).positiveCoeff2 :=
-      record(33, 32).asSInt
-    decoded.binary.post(lane).positiveLeftShift1 :=
-      record(38, 34)
-    decoded.binary.post(lane).positiveLeftShift2 :=
-      record(43, 39)
-    decoded.binary.post(lane).positiveCommonShift :=
-      record(51, 44).asSInt
-    decoded.binary.post(lane).positiveBias :=
-      record(83, 52).asSInt
-    decoded.binary.post(lane).negativeCoeff1 :=
-      record(85, 84).asSInt
-    decoded.binary.post(lane).negativeCoeff2 :=
-      record(87, 86).asSInt
-    decoded.binary.post(lane).negativeLeftShift1 :=
-      record(92, 88)
-    decoded.binary.post(lane).negativeLeftShift2 :=
-      record(97, 93)
-    decoded.binary.post(lane).negativeCommonShift :=
-      record(105, 98).asSInt
-    decoded.binary.post(lane).negativeBias :=
-      record(137, 106).asSInt
-    decoded.binary.post(lane).qMin :=
-      record(169, 138).asSInt
-    decoded.binary.post(lane).qMax :=
-      record(201, 170).asSInt
-    decoded.binary.outputSignThreshold(lane) :=
-      record(233, 202).asSInt
-  }
-
-  io.readResponse.valid := state === sending
-  io.readResponse.bits := decoded
-  when(io.readResponse.fire) {
+  io.readResponse <> rowBuffer.io.deq
+  when(io.readResponse.fire && io.readResponse.bits.last) {
     state := idle
+  }
+
+  when(issueRow =/= rowConsumed) {
+    when(issueRow) {
+      rowOutstanding := rowOutstanding + 1.U
+    }.otherwise {
+      rowOutstanding := rowOutstanding - 1.U
+    }
   }
 
   io.correctionReadResponse.valid := state === sendingCorrection
